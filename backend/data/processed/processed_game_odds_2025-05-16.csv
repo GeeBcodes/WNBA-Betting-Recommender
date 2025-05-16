@@ -1,0 +1,5 @@
+game_id,home_team,away_team,game_datetime,source,home_team_odds,away_team_odds,spread_line,home_team_spread_odds,away_team_spread_odds,total_line,over_odds,under_odds,last_updated
+c7d6c42c-f87b-4793-a318-f6e1819cfcfb,Team A,Team B,2025-05-16 19:00:00,PrizePicks_Placeholder,-110,-110,-1.5,-110,-110,210.5,-110,-110,2025-05-16 02:45:36.283614
+d2b91a84-83f8-4b4e-9e70-d7f9c36fb12e,Team C,Team D,2025-05-16 21:00:00,PrizePicks_Placeholder,-150,130,-3.5,-105,-115,205.5,-110,-110,2025-05-16 02:45:36.283614
+ffa01984-7c78-4165-a6ff-4d6ef620a286,Team A,Team B,2025-05-16 19:00:00,Underdog_Placeholder,-110,-110,-1.5,-110,-110,210.5,-110,-110,2025-05-16 02:45:36.342488
+34c24167-74f8-47e2-8a0d-44cf53542811,Team C,Team D,2025-05-16 21:00:00,Underdog_Placeholder,-150,130,-3.5,-105,-115,205.5,-110,-110,2025-05-16 02:45:36.342488

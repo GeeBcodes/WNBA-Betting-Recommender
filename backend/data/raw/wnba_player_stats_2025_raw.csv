@@ -1,0 +1,6 @@
+player_id,player_name,team,games_played,points,rebounds,assists,steals,blocks,season
+1,Player A,Team X,10,150,50,30,10,5,2025
+2,Player B,Team Y,12,180,60,35,12,3,2025
+3,Player C,Team X,10,120,40,25,8,6,2025
+4,Player D,Team Z,8,90,30,20,7,2,2025
+5,Player E,Team Y,11,165,55,33,11,4,2025

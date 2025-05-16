@@ -1,0 +1,15 @@
+fastapi~=0.104.0
+pydantic~=2.5.0
+uvicorn[standard]==0.22.0
+scikit-learn==1.2.2
+joblib==1.4.2 # Or a recent compatible version
+SQLAlchemy==2.0.30
+psycopg2-binary==2.9.9
+alembic==1.13.1
+
+# Added for train_model.py
+pandas==2.2.3
+python-dateutil==2.9.0.post0
+pytz==2025.2
+six==1.17.0
+tzdata==2025.2 

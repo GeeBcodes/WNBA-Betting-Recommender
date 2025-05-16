@@ -1,0 +1,4 @@
+prop_id,game_id,player_name,prop_type,line,over_odds,under_odds,source,last_updated
+df80dd10-b49a-4901-a2de-2c0eb8c36c9d,,Player A,points,15.5,-115,-105,PrizePicks_Placeholder,2025-05-16 02:45:36.319491
+567582aa-314f-4224-8875-ee15422c2120,,Player B,rebounds,7.5,-120,-100,PrizePicks_Placeholder,2025-05-16 02:45:36.319491
+9e9c9ec6-735a-40b8-880b-2fa2f9249c5b,,Player C,assists,5.5,-110,-110,PrizePicks_Placeholder,2025-05-16 02:45:36.319491

@@ -1,0 +1,6 @@
+.cursor/mcp.json 
+.cursor
+cursor_metrics.md
+documentation
+backend\db\session.py
+backend\venv
