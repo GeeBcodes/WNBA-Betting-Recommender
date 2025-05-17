@@ -1,3 +1,4 @@
+.gitignore
 .cursor/mcp.json 
 .cursor
 cursor_metrics.md
