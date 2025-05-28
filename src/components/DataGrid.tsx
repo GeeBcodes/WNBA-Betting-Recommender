@@ -13,19 +13,53 @@ const DataGrid: React.FC<DataGridProps> = ({ predictions, onSelectionChanged }) 
   const gridRef = useRef<AgGridReact<Prediction>>(null); // Ref for accessing Grid API
 
   // Column Definitions: Defines & controls grid columns.
-  // Updated to match the TEMPORARILY ADJUSTED Prediction interface fields
   const colDefs = useMemo<ColDef<Prediction>[]>(() => [
     {
       headerName: 'Select',
       checkboxSelection: true,
-      headerCheckboxSelection: true, // Optional: for select/deselect all
+      headerCheckboxSelection: true,
       width: 100,
-      pinned: 'left', // Optional: pin the select column
+      pinned: 'left',
     },
-    { field: "id", headerName: "Pred. ID", filter: true, sortable: true, minWidth: 250 },
-    { field: "player_prop_odd_id", headerName: "Prop Odd ID", filter: true, sortable: true, minWidth: 250 },
-    { field: "model_version_id", headerName: "Model Ver. ID", filter: true, sortable: true, minWidth: 250 },
-    { field: "prediction_datetime", headerName: "Timestamp", filter: true, sortable: true, minWidth: 180 },
+    { 
+      headerName: "Player", 
+      valueGetter: p => p.data?.player_prop?.player?.player_name || p.data?.player_prop?.player_name_api || 'N/A', 
+      filter: true, 
+      sortable: true, 
+      minWidth: 150 
+    },
+    { 
+      headerName: "Game", 
+      valueGetter: p => {
+        const game = p.data?.player_prop?.game;
+        return game ? `${game.away_team} @ ${game.home_team}` : 'N/A';
+      }, 
+      filter: true, 
+      sortable: true, 
+      minWidth: 200 
+    },
+    { 
+      headerName: "Market", 
+      valueGetter: p => p.data?.player_prop?.market?.description || p.data?.player_prop?.market?.key || 'N/A', 
+      filter: true, 
+      sortable: true, 
+      minWidth: 180 
+    },
+    {
+      headerName: "Line",
+      valueGetter: p => {
+        const outcomes = p.data?.player_prop?.outcomes;
+        // Assuming the first outcome contains the relevant 'point' for the line
+        // This might need adjustment based on the actual structure of 'outcomes'
+        if (outcomes && outcomes.length > 0 && typeof outcomes[0].point !== 'undefined') {
+          return outcomes[0].point;
+        }
+        return 'N/A';
+      },
+      sortable: true,
+      filter: 'agNumberColumnFilter',
+      minWidth: 100
+    },
     {
       field: "predicted_over_probability",
       headerName: "Over Prob.",
@@ -42,8 +76,7 @@ const DataGrid: React.FC<DataGridProps> = ({ predictions, onSelectionChanged }) 
       cellDataType: 'number',
       minWidth: 120
     },
-    // NOTE: Missing fields for user-friendly display (player name, game, market, line) will be addressed later
-    // by enhancing backend response for GET /predictions.
+    // Removed: player_prop_odd_id, model_version_id, prediction_datetime
   ], []);
 
   // Callback for when grid selection changes

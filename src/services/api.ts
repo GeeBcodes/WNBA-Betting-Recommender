@@ -51,21 +51,46 @@ export interface PlayerStatFull { // Renaming from PlayerStat to avoid confusion
 }
 // --- END: New/Updated Interfaces for Stats ---
 
-// Placeholder types - we will refine these later based on backend schemas
-// TEMPORARILY ADJUSTED FOR CURRENT BACKEND SCHEMA - NEEDS REFINEMENT
-export interface Prediction {
-  id: string; // Changed from number to string to accommodate UUID from backend for now
-  player_prop_odd_id: string; // Added based on backend schema
-  model_version_id: string; // Added based on backend schema
-  predicted_over_probability: number | null; // Aligned with backend schema (Optional[float])
-  predicted_under_probability: number | null; // Aligned with backend schema (Optional[float])
-  prediction_datetime: string; // Added, assuming datetime becomes string
+// --- Odds Related Interfaces (from backend/schemas/odds.py) ---
+export interface Bookmaker {
+  id: string;
+  key: string;
+  title: string;
+}
 
-  // Fields that DataGrid was expecting, now missing or needing mapping:
-  // game_id: string;
-  // player_id: string;
-  // market: string; 
-  // line: number;
+export interface Market {
+  id: string;
+  key: string;
+  description?: string | null;
+}
+
+export interface PlayerProp {
+  id: string; // This is player_prop_id in Prediction
+  game_id: string;
+  player_id?: string | null;
+  bookmaker_id: string;
+  market_id: string;
+  player_name_api?: string | null;
+  last_update_api?: string | null; // datetime
+  outcomes?: Array<{ name: string; price: number; point?: number }> | null; // Simplified, adjust if more complex
+
+  // Expanded details
+  bookmaker?: Bookmaker | null;
+  market?: Market | null;
+  player?: Player | null;
+  game?: Game | null;
+}
+// --- End Odds Related Interfaces ---
+
+export interface Prediction {
+  id: string; 
+  // player_prop_odd_id: string; // This will be replaced by the nested player_prop object
+  // model_version_id: string; // To be removed from display
+  predicted_over_probability: number | null; 
+  predicted_under_probability: number | null; 
+  // prediction_datetime: string; // To be removed from display
+
+  player_prop?: PlayerProp | null; // Nested PlayerProp details
 }
 
 export interface ParlayData {
