@@ -9,7 +9,7 @@ const Layout: React.FC<LayoutProps> = () => {
   return (
     <div className="app-layout">
       {/* <header>App Header / Navbar could go here</header> */}
-      <main style={{ padding: '20px' }}>
+      <main>
         <Outlet /> {/* Child routes will render here */}
       </main>
       {/* <footer>App Footer could go here</footer> */}

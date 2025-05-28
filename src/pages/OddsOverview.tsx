@@ -1,12 +1,14 @@
 import React from 'react';
+import OddsTables from '../components/OddsTables';
 
-const OddsOverview = () => {
+const OddsOverviewPage: React.FC = () => {
   return (
     <div>
-      <h1>Odds Overview Page</h1>
-      {/* Upcoming game odds and filters will go here */}
+      <h1>Odds Overview</h1>
+      <p>Displaying current game odds and player prop odds.</p>
+      <OddsTables />
     </div>
   );
 };
 
-export default OddsOverview; 
+export default OddsOverviewPage; 

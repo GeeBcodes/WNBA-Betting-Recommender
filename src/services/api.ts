@@ -7,6 +7,50 @@ const apiClient = axios.create({
   },
 });
 
+// --- START: New/Updated Interfaces for Stats ---
+// Matches backend.schemas.player.Player
+export interface Player {
+  id: string; // uuid.UUID
+  player_name: string;
+  team_name?: string | null;
+  player_api_id?: string | null;
+}
+
+// Matches backend.schemas.game.Game
+export interface Game {
+  id: string; // uuid.UUID
+  external_id?: string | null;
+  home_team: string;
+  away_team: string;
+  game_datetime?: string | null; // datetime from backend
+}
+
+// Matches backend.schemas.player_stats.PlayerStatRead
+export interface PlayerStatFull { // Renaming from PlayerStat to avoid confusion
+  id: string; // uuid.UUID (for the stat record itself)
+  player_id: string; // uuid.UUID (FK)
+  game_id: string; // uuid.UUID (FK)
+  game_date?: string | null; // date
+  points?: number | null;
+  rebounds?: number | null;
+  assists?: number | null;
+  steals?: number | null;
+  blocks?: number | null;
+  turnovers?: number | null;
+  minutes_played?: number | null;
+  field_goals_made?: number | null;
+  field_goals_attempted?: number | null;
+  three_pointers_made?: number | null;
+  three_pointers_attempted?: number | null;
+  free_throws_made?: number | null;
+  free_throws_attempted?: number | null;
+  plus_minus?: number | null;
+
+  player: Player; // Nested Player object
+  game: Game;     // Nested Game object
+}
+// --- END: New/Updated Interfaces for Stats ---
+
 // Placeholder types - we will refine these later based on backend schemas
 // TEMPORARILY ADJUSTED FOR CURRENT BACKEND SCHEMA - NEEDS REFINEMENT
 export interface Prediction {
@@ -27,7 +71,7 @@ export interface Prediction {
 export interface ParlayData {
   name: string;
   legs: Array<{
-    prediction_id: number;
+    prediction_id: string;
     type: 'over' | 'under';
   }>;
   // Add other relevant fields for creating a parlay
@@ -83,6 +127,117 @@ export const postParlay = async (parlayData: ParlayData): Promise<any> => { // R
   } catch (error) {
     console.error('Error posting parlay:', error);
     // Similar to getPredictions, handle error appropriately
+    throw error;
+  }
+};
+
+// --- New API functions for expanded backend integration ---
+
+// Model Versions
+export interface ModelVersion {
+  id: string;
+  version_name: string;
+  description?: string;
+  trained_at: string;
+}
+
+export const getModelVersions = async (): Promise<ModelVersion[]> => {
+  try {
+    const response = await apiClient.get<ModelVersion[]>("/model_versions/");
+    return response.data;
+  } catch (error) {
+    console.error("Error fetching model versions:", error);
+    throw error;
+  }
+};
+
+// Parlays
+export interface Parlay {
+  id: string;
+  selections: any[];
+  combined_probability?: number;
+  total_odds?: number;
+  created_at: string;
+}
+
+export const getParlays = async (): Promise<Parlay[]> => {
+  try {
+    const response = await apiClient.get<Parlay[]>("/parlays");
+    return response.data;
+  } catch (error) {
+    console.error("Error fetching parlays:", error);
+    throw error;
+  }
+};
+
+// Player Stats
+/* Commenting out old PlayerStat interface
+export interface PlayerStat {
+  player_id: string | number;
+  player_name: string;
+  team_name: string;
+  points?: number;
+  rebounds?: number;
+  assists?: number;
+  steals?: number;
+  blocks?: number;
+  turnovers?: number;
+  minutes_played?: number;
+  game_date?: string;
+}
+*/
+
+export const getPlayerStats = async (): Promise<PlayerStatFull[]> => { // Updated return type
+  try {
+    const response = await apiClient.get<PlayerStatFull[]>("/api/stats"); // Updated generic type
+    return response.data;
+  } catch (error) {
+    console.error("Error fetching player stats:", error);
+    throw error;
+  }
+};
+
+// Odds
+export interface GameOdd {
+  game_id: string;
+  home_team: string;
+  away_team: string;
+  home_team_odds?: number;
+  away_team_odds?: number;
+  spread?: number;
+  over_under?: number;
+  source: string;
+  last_updated?: string;
+}
+
+export interface PlayerPropOdd {
+  prop_id: number;
+  player_id: number;
+  player_name: string;
+  stat_type: string;
+  line: number;
+  over_odds: number;
+  under_odds: number;
+  source: string;
+  last_updated?: string;
+}
+
+export const getGameOdds = async (): Promise<GameOdd[]> => {
+  try {
+    const response = await apiClient.get<GameOdd[]>("/api/odds/games");
+    return response.data;
+  } catch (error) {
+    console.error("Error fetching game odds:", error);
+    throw error;
+  }
+};
+
+export const getPlayerPropOdds = async (playerId: number): Promise<PlayerPropOdd[]> => {
+  try {
+    const response = await apiClient.get<PlayerPropOdd[]>(`/api/odds/props/player/${playerId}`);
+    return response.data;
+  } catch (error) {
+    console.error(`Error fetching player prop odds for player ${playerId}:`, error);
     throw error;
   }
 };
