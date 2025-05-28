@@ -1,13 +1,27 @@
-from pydantic import BaseModel, Json
-from typing import Optional, List, Any
+from pydantic import BaseModel, ConfigDict, validator, field_validator
+from typing import List, Optional, Any, Dict
 import uuid
 from datetime import datetime
 
+# Details for each selection in a parlay
+class ParlaySelectionDetail(BaseModel):
+    prediction_id: str # Changed to str from uuid.UUID to match what parlay_builder might send as JSON
+    player_prop_id: str # Changed to str from uuid.UUID
+    player_name: str
+    market_key: str
+    game_id: str # Changed to str from uuid.UUID
+    line_point: Optional[float] = None
+    chosen_outcome: str # e.g., "Over", "Under"
+    chosen_probability: float
+
 class ParlayBase(BaseModel):
-    selections: List[Any] # Could be list of prediction_ids (UUIDs) or more complex objects
+    selections: List[ParlaySelectionDetail] # Store detailed selections
     combined_probability: Optional[float] = None
-    total_odds: Optional[float] = None
-    # user_id: Optional[uuid.UUID] = None # If users are added
+    total_odds: Optional[float] = None # Assuming decimal odds for now
+
+    model_config = ConfigDict(
+        protected_namespaces=() # Example, if needed later
+    )
 
 class ParlayCreate(ParlayBase):
     pass
@@ -16,6 +30,7 @@ class Parlay(ParlayBase):
     id: uuid.UUID
     created_at: datetime
 
-    class Config:
-        # orm_mode = True # Pydantic V1 way
-        from_attributes = True # Pydantic V2 way 
+    model_config = ConfigDict(
+        from_attributes=True,
+        protected_namespaces=() 
+    ) 

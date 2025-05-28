@@ -1,38 +1,101 @@
 from pydantic import BaseModel, ConfigDict
+from typing import Optional, List, Dict, Any
 from datetime import datetime
+import uuid
 
+# --- Sport Schemas ---
+class SportBase(BaseModel):
+    key: str
+    group_name: Optional[str] = None
+    title: Optional[str] = None
+    description: Optional[str] = None
+    active: bool = True
+    has_outrights: bool = False
+
+class SportCreate(SportBase):
+    pass
+
+class Sport(SportBase):
+    id: uuid.UUID
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+# --- Bookmaker Schemas ---
+class BookmakerBase(BaseModel):
+    key: str
+    title: str
+
+class BookmakerCreate(BookmakerBase):
+    pass
+
+class Bookmaker(BookmakerBase):
+    id: uuid.UUID
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+# --- Market Schemas ---
+class MarketBase(BaseModel):
+    key: str
+    description: Optional[str] = None
+
+class MarketCreate(MarketBase):
+    pass
+
+class Market(MarketBase):
+    id: uuid.UUID
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+# --- GameOdd Schemas ---
 class GameOddBase(BaseModel):
-    home_team: str
-    away_team: str
-    home_team_odds: float | None = None
-    away_team_odds: float | None = None
-    spread: float | None = None
-    over_under: float | None = None
-    source: str
-    last_updated: datetime | None = None
+    game_id: uuid.UUID
+    bookmaker_id: uuid.UUID
+    market_id: uuid.UUID
+    last_update_api: Optional[datetime] = None
+    outcomes: Optional[List[Dict[str, Any]]] = None
 
 class GameOddCreate(GameOddBase):
     pass
 
 class GameOdd(GameOddBase):
-    game_id: str # Can be a unique string identifying the game
+    id: uuid.UUID
 
     model_config = ConfigDict(from_attributes=True)
 
-class PlayerPropOddBase(BaseModel):
-    player_name: str
-    stat_type: str 
-    line: float
-    over_odds: int
-    under_odds: int
-    source: str
-    last_updated: datetime | None = None
+# Read schema with related objects if needed later
+class GameOddRead(GameOdd):
+    bookmaker: Optional[Bookmaker] = None 
+    market: Optional[Market] = None
+    # game: Optional[Game] # Assuming you have a Game schema in game.py
 
-class PlayerPropOddCreate(PlayerPropOddBase):
+
+# --- PlayerProp Schemas ---
+class PlayerPropBase(BaseModel):
+    game_id: uuid.UUID
+    player_id: Optional[uuid.UUID] = None
+    bookmaker_id: uuid.UUID
+    market_id: uuid.UUID
+    player_name_api: Optional[str] = None
+    last_update_api: Optional[datetime] = None
+    outcomes: Optional[List[Dict[str, Any]]] = None
+
+class PlayerPropCreate(PlayerPropBase):
     pass
 
-class PlayerPropOdd(PlayerPropOddBase):
-    prop_id: int # Assuming a unique ID for each prop bet
-    player_id: int # Link to the player
+class PlayerProp(PlayerPropBase):
+    id: uuid.UUID
 
-    model_config = ConfigDict(from_attributes=True) 
+    model_config = ConfigDict(from_attributes=True)
+
+# Read schema with related objects
+class PlayerPropRead(PlayerProp):
+    bookmaker: Optional[Bookmaker] = None
+    market: Optional[Market] = None
+    # player: Optional[Player] # Assuming you have a Player schema in player.py
+    # game: Optional[Game] # Assuming you have a Game schema in game.py
+
+
+# Update __all__ in backend/schemas/__init__.py if you create it 

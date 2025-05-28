@@ -3,9 +3,9 @@ from sqlalchemy.orm import Session
 import uuid # For UUID type
 from typing import List
 
-from backend.app import crud
-from backend.schemas import model_version as model_version_schema # Alias for clarity
-from backend.app.dependencies import get_db
+from .. import crud
+from schemas import model_version as model_version_schema # Alias for clarity
+from ..dependencies import get_db
 
 router = APIRouter(
     prefix="/model_versions",

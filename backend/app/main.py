@@ -1,12 +1,13 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from backend.schemas.health import PingResponse
-from backend.app.routers import player_stats, odds
-from backend.app.routers import model_versions, predictions, parlays
+from schemas.health import PingResponse
+from .routers import player_stats, odds
+from .routers import model_versions, predictions, parlays
 
 app = FastAPI(
     title="WNBA Betting Recommender API",
-    version="0.1.0",
+    description="API for WNBA game data, odds, predictions, and parlay recommendations.",
+    version="0.1.0"
 )
 
 # CORS Configuration

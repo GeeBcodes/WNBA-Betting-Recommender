@@ -1,104 +1,62 @@
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, joinedload # Added joinedload
 import uuid # For UUID type
 from typing import List, Optional # For list and optional types
+from datetime import date # New import for date filtering
 
 from backend.db import models
-from backend.schemas import model_version as model_version_schema # Alias to avoid name collision
-from backend.schemas import prediction as prediction_schema # Added for Prediction CRUD
-from backend.schemas import parlay as parlay_schema # Added for Parlay CRUD
+from backend.schemas import player as player_schema # New import
+from backend.schemas import game as game_schema # New import
+from backend.schemas import player_stats as player_stat_schema # New import for PlayerStat
 
-# CRUD for ModelVersion
+# CRUD for ModelVersion - MOVED to crud/model_versions.py
 
-def create_model_version(db: Session, model_version: model_version_schema.ModelVersionCreate) -> models.ModelVersion:
-    db_model_version = models.ModelVersion(
-        version_name=model_version.version_name,
-        description=model_version.description
-        # trained_at is default in model
-    )
-    db.add(db_model_version)
+# --- CRUD for Prediction --- MOVED to crud/predictions.py
+
+# --- CRUD for Parlay --- MOVED to crud/parlays.py
+
+# --- CRUD for Player ---
+def get_player(db: Session, player_id: uuid.UUID) -> Optional[models.Player]:
+    return db.query(models.Player).filter(models.Player.id == player_id).first()
+
+def get_player_by_api_id(db: Session, player_api_id: str) -> Optional[models.Player]: # This might be wnba_player_id
+    # Assuming player_api_id corresponds to wnba_player_id or a similar unique external ID
+    # If models.Player has a specific field like `external_api_id` or `wnba_player_id`, use that.
+    # For now, using a hypothetical `player_api_id` field.
+    # Replace `models.Player.player_api_id` with the actual field name if different.
+    # return db.query(models.Player).filter(models.Player.player_api_id == player_api_id).first()
+    # Based on current models.Player, there is no player_api_id. Only player_name is unique.
+    # This function might need revision based on how players are uniquely identified from APIs.
+    # For now, let's assume player_name is used if no other API ID field exists.
+    return db.query(models.Player).filter(models.Player.player_name == player_api_id).first() # Fallback to name if no API ID
+
+def get_players(db: Session, skip: int = 0, limit: int = 100) -> List[models.Player]:
+    return db.query(models.Player).offset(skip).limit(limit).all()
+
+def create_player(db: Session, player: player_schema.PlayerCreate) -> models.Player:
+    db_player = models.Player(**player.model_dump())
+    db.add(db_player)
     db.commit()
-    db.refresh(db_model_version)
-    return db_model_version
+    db.refresh(db_player)
+    return db_player
 
-def get_model_version(db: Session, model_version_id: uuid.UUID) -> Optional[models.ModelVersion]:
-    return db.query(models.ModelVersion).filter(models.ModelVersion.id == model_version_id).first()
+# --- CRUD for Game ---
+def get_game(db: Session, game_id: uuid.UUID) -> Optional[models.Game]:
+    return db.query(models.Game).filter(models.Game.id == game_id).first()
 
-def get_model_version_by_name(db: Session, version_name: str) -> Optional[models.ModelVersion]:
-    return db.query(models.ModelVersion).filter(models.ModelVersion.version_name == version_name).first()
+def get_game_by_external_id(db: Session, external_id: str) -> Optional[models.Game]:
+    # Assuming Game model has an 'external_id' field for IDs from data sources like sportsdataverse
+    return db.query(models.Game).filter(models.Game.external_id == external_id).first()
 
-def get_model_versions(db: Session, skip: int = 0, limit: int = 100) -> List[models.ModelVersion]:
-    return db.query(models.ModelVersion).offset(skip).limit(limit).all()
+def get_games(db: Session, skip: int = 0, limit: int = 100) -> List[models.Game]:
+    return db.query(models.Game).order_by(models.Game.game_datetime.desc()).offset(skip).limit(limit).all()
 
-# We might not need update/delete for model versions initially, or they might have specific logic
-# (e.g., can only delete if no predictions are linked). For now, let's omit them.
-# If needed, they would look like:
-# def update_model_version(db: Session, model_version_id: uuid.UUID, model_version_update: model_version_schema.ModelVersionUpdate) -> Optional[models.ModelVersion]:
-#     db_model_version = get_model_version(db, model_version_id)
-#     if db_model_version:
-#         update_data = model_version_update.model_dump(exclude_unset=True) # Pydantic v2
-#         # update_data = model_version_update.dict(exclude_unset=True) # Pydantic v1
-#         for key, value in update_data.items():
-#             setattr(db_model_version, key, value)
-#         db.commit()
-#         db.refresh(db_model_version)
-#     return db_model_version
-
-# def delete_model_version(db: Session, model_version_id: uuid.UUID) -> Optional[models.ModelVersion]:
-#     db_model_version = get_model_version(db, model_version_id)
-#     if db_model_version:
-#         db.delete(db_model_version)
-#         db.commit()
-#     return db_model_version
-
-# --- CRUD for Prediction ---
-def create_prediction(db: Session, prediction: prediction_schema.PredictionCreate) -> models.Prediction:
-    db_prediction = models.Prediction(
-        player_prop_odd_id=prediction.player_prop_odd_id,
-        model_version_id=prediction.model_version_id,
-        predicted_over_probability=prediction.predicted_over_probability,
-        predicted_under_probability=prediction.predicted_under_probability
-        # prediction_datetime is default in model
-    )
-    db.add(db_prediction)
+def create_game(db: Session, game: game_schema.GameCreate) -> models.Game:
+    db_game = models.Game(**game.model_dump())
+    db.add(db_game)
     db.commit()
-    db.refresh(db_prediction)
-    return db_prediction
+    db.refresh(db_game)
+    return db_game
 
-def get_prediction(db: Session, prediction_id: uuid.UUID) -> Optional[models.Prediction]:
-    return db.query(models.Prediction).filter(models.Prediction.id == prediction_id).first()
-
-def get_predictions(db: Session, skip: int = 0, limit: int = 100) -> List[models.Prediction]:
-    return db.query(models.Prediction).offset(skip).limit(limit).all()
-
-def get_predictions_by_player_prop_odd(db: Session, player_prop_odd_id: uuid.UUID, skip: int = 0, limit: int = 100) -> List[models.Prediction]:
-    return db.query(models.Prediction).filter(models.Prediction.player_prop_odd_id == player_prop_odd_id).offset(skip).limit(limit).all()
-
-def get_predictions_by_model_version(db: Session, model_version_id: uuid.UUID, skip: int = 0, limit: int = 100) -> List[models.Prediction]:
-    return db.query(models.Prediction).filter(models.Prediction.model_version_id == model_version_id).offset(skip).limit(limit).all()
-
-# Update/Delete for Predictions might also have specific logic (e.g., soft delete, or preventing updates)
-# For now, omitting update/delete for Predictions.
-
-# --- CRUD for Parlay ---
-def create_parlay(db: Session, parlay: parlay_schema.ParlayCreate) -> models.Parlay:
-    db_parlay = models.Parlay(
-        selections=parlay.selections, # This will be JSON
-        combined_probability=parlay.combined_probability,
-        total_odds=parlay.total_odds
-        # created_at is default in model
-        # user_id can be added later if users are implemented
-    )
-    db.add(db_parlay)
-    db.commit()
-    db.refresh(db_parlay)
-    return db_parlay
-
-def get_parlay(db: Session, parlay_id: uuid.UUID) -> Optional[models.Parlay]:
-    return db.query(models.Parlay).filter(models.Parlay.id == parlay_id).first()
-
-def get_parlays(db: Session, skip: int = 0, limit: int = 100) -> List[models.Parlay]: 
-    return db.query(models.Parlay).offset(skip).limit(limit).all()
-
-# Update for Parlay might involve recalculating odds/probability if selections change.
-# Delete for Parlay is straightforward if it's a hard delete.
-# Omitting update/delete for now for simplicity. 
+# --- CRUD for PlayerStat --- MOVED to crud/player_stats.py
+# The get_player_stat, get_player_stats, create_player_stat functions were here.
+# We are now relying on the versions in crud/player_stats.py 

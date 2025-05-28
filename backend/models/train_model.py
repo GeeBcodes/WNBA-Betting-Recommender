@@ -1,191 +1,326 @@
 import sys
 import os
+import argparse # Added
+import logging
+from pathlib import Path # Path is used, ensure it's imported
+import datetime # datetime is used, ensure it's imported
+import uuid
+from typing import Optional, List # Added List
 
-# Add project root to sys.path to allow for absolute imports from 'backend'
+# Add project root to sys.path
 PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
 sys.path.insert(0, PROJECT_ROOT)
 
 import pandas as pd
-from sklearn.model_selection import train_test_split
-from sklearn.ensemble import RandomForestClassifier # Example model
-from sklearn.metrics import accuracy_score
+import numpy as np # Added numpy
+from sklearn.model_selection import TimeSeriesSplit # Changed from train_test_split
+from sklearn.ensemble import RandomForestRegressor # Changed from Classifier
+from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score # Changed metrics
 from sklearn.pipeline import Pipeline
-from sklearn.preprocessing import StandardScaler # Example preprocessor
+from sklearn.preprocessing import StandardScaler, OneHotEncoder # Added OneHotEncoder
+from sklearn.compose import ColumnTransformer # Added
+from sklearn.impute import SimpleImputer # Added
 import joblib
-import logging
-from pathlib import Path
-import datetime
-import uuid # Added for UUIDs
-from typing import Optional
 
 # Database related imports
-from sqlalchemy.orm import Session
-from backend.db.session import SessionLocal # To create DB sessions
-from backend.app import crud # To use CRUD functions
-from backend.schemas import model_version as model_version_schema # For creating ModelVersion records
+from sqlalchemy.orm import Session, joinedload # Added joinedload
+from backend.db.session import SessionLocal
+# Updated CRUD import for model versions
+from backend.app.crud import model_versions as crud_mv
+from backend.db import models as db_models # For querying DB models
+from backend.schemas import model_version as mv_schema # For creating ModelVersion schema
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__) # Use a named logger
 
 # Define paths
-MODEL_DIR = Path(__file__).parent / "artifacts"
-MODEL_DIR.mkdir(parents=True, exist_ok=True) # Ensure model artifact directory exists
-MODEL_NAME_PREFIX = "wnba_player_prop_model"
+MODEL_ARTIFACTS_DIR = Path(__file__).parent / "artifacts"
+MODEL_ARTIFACTS_DIR.mkdir(parents=True, exist_ok=True)
 
-# Determine current year for data path
-CURRENT_YEAR = datetime.datetime.now().year
-DATA_PATH = Path(__file__).parent.parent / "data" / "processed" / f"processed_player_data_{CURRENT_YEAR}.csv"
-
-# Utility to get a database session
 def get_db_session() -> Session:
     db = SessionLocal()
     try:
-        # This is a context manager pattern if needed `yield` for a block
-        # For simple calls, just returning db and closing in finally is also an option
-        # However, for consistency with FastAPI `Depends`, yielding is fine if we manage its scope.
-        # For a script, it might be simpler to create, use, and close in each function or pass around. 
-        # For now, this function will just return a session that the caller must close.
-        return db 
+        return db
     except Exception as e:
-        logging.error(f"Error creating database session: {e}")
+        logger.error(f"Error creating database session: {e}")
         if db:
-            db.close() # Ensure db is closed on error during creation if partially successful
+            db.close()
         raise
 
-def load_data(data_path: Path) -> pd.DataFrame:
-    """Loads data from the specified path."""
-    logging.info(f"Loading data from {data_path}")
-    if not data_path.exists():
-        logging.error(f"Data file not found at {data_path}")
-        # For now, creating a dummy DataFrame for demonstration
-        return pd.DataFrame({
-            'feature1': [1, 2, 3, 4, 5, 6, 7, 8, 9, 10],
-            'feature2': [10, 9, 8, 7, 6, 5, 4, 3, 2, 1],
-            'target': [0, 1, 0, 1, 0, 1, 0, 1, 0, 1] # Example binary target
-        })
-    return pd.read_csv(data_path)
+def load_data(db: Session, target_stat: str, seasons: Optional[List[int]] = None) -> pd.DataFrame:
+    """
+    Loads player stats, game, and player data from the database for the specified target stat and seasons.
+    """
+    logger.info(f"Loading data for target stat: '{target_stat}', seasons: {seasons if seasons else 'all'}")
 
-def train_model(df: pd.DataFrame):
-    """Trains a model on the given DataFrame."""
-    logging.info("Starting model training...")
+    query = (
+        db.query(
+            db_models.PlayerStat.id.label('player_stat_id'),
+            db_models.PlayerStat.player_id,
+            db_models.PlayerStat.game_id,
+            db_models.PlayerStat.minutes_played,
+            getattr(db_models.PlayerStat, target_stat).label(target_stat), # Dynamically get target stat
+            db_models.Game.game_datetime,
+            db_models.Game.home_team, # Changed from home_team_id
+            db_models.Game.away_team, # Changed from away_team_id
+            db_models.Game.season, # Assuming 'season' column exists in Game model
+            db_models.Player.player_name # Example player feature
+            # Add other relevant fields from PlayerStat, Game, Player
+        )
+        .join(db_models.Game, db_models.PlayerStat.game_id == db_models.Game.id)
+        .join(db_models.Player, db_models.PlayerStat.player_id == db_models.Player.id)
+    )
+
+    if seasons:
+        query = query.filter(db_models.Game.season.in_(seasons))
+
+    # Add ordering for time-series consistency if needed before df conversion
+    query = query.order_by(db_models.Game.game_datetime, db_models.PlayerStat.player_id)
     
-    if df.empty or 'target' not in df.columns:
-        logging.error("DataFrame is empty or 'target' column is missing. Skipping training.")
-        return None
+    try:
+        df = pd.read_sql_query(query.statement, db.bind)
+        if df.empty:
+            logger.warning(f"No data found for target_stat='{target_stat}' and seasons='{seasons}'.")
+            return pd.DataFrame()
+        logger.info(f"Successfully loaded {len(df)} records from the database.")
+        # Basic data type conversions if necessary (e.g., game_datetime to datetime)
+        df['game_datetime'] = pd.to_datetime(df['game_datetime'])
+        return df
+    except Exception as e:
+        logger.error(f"Error loading data from database: {e}", exc_info=True)
+        return pd.DataFrame()
 
-    # Define numeric features to be used for training
-    # Exclude IDs like player_id if they are not intended as direct features for this model type
-    # 'season' can be numeric but its utility as a raw feature depends on the model context.
-    numeric_features = [
-        'games_played', 'points', 'rebounds', 'assists', 
-        'steals', 'blocks', 'ppg' # 'season' and 'player_id' could be added if appropriate
-    ]
+
+def feature_engineering(df: pd.DataFrame, target_stat: str) -> pd.DataFrame:
+    """
+    Performs feature engineering. Creates lagged features, rolling averages, etc.
+    """
+    if df.empty:
+        logger.warning("DataFrame is empty. Skipping feature engineering.")
+        return df
+        
+    logger.info(f"Performing feature engineering for target stat: {target_stat}")
     
-    # Ensure all selected numeric features actually exist in the DataFrame
-    available_numeric_features = [col for col in numeric_features if col in df.columns]
-    if not available_numeric_features:
-        logging.error("No numeric features available for training after selection. Skipping training.")
-        return None
+    df = df.sort_values(by=['player_id', 'game_datetime'])
+
+    # Example: Lagged features for the target stat (e.g., performance in last 1, 2, 3 games)
+    for lag in [1, 2, 3]:
+        df[f'{target_stat}_lag_{lag}'] = df.groupby('player_id')[target_stat].shift(lag)
     
-    logging.info(f"Using the following numeric features for training: {available_numeric_features}")
+    # Example: Rolling average for target_stat (e.g., avg over last 3 games, excluding current)
+    df[f'{target_stat}_roll_avg_3'] = df.groupby('player_id')[target_stat].transform(
+        lambda x: x.rolling(window=3, min_periods=1).mean().shift(1) # shift(1) to avoid data leakage
+    )
+    df[f'minutes_played_roll_avg_3'] = df.groupby('player_id')['minutes_played'].transform(
+        lambda x: x.rolling(window=3, min_periods=1).mean().shift(1)
+    )
 
-    X = df[available_numeric_features] # Select only numeric features
-    y = df['target']
+    # Example: Days since last game (rest days)
+    df['days_since_last_game'] = df.groupby('player_id')['game_datetime'].diff().dt.days.fillna(7) # Assume 7 for first game or use a larger sensible default
 
-    # Basic type checking for features - adapt as needed
-    # This check might be redundant now, but can be a safeguard
-    if not all(X[col].dtype in ['int64', 'float64'] for col in X.columns):
-        logging.warning("Some features are not numeric. Model training might fail or be suboptimal.")
-        # Add more sophisticated feature engineering/preprocessing here
+    # Example: Home/Away status (requires team_id for the player's team on PlayerStat or Game)
+    # This part needs the player's actual team_id for that game to compare with home_team_id
+    # df['is_home'] = (df['player_team_id_column'] == df['home_team_id']).astype(int) 
 
-    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+    # Categorical features like opponent team ID might need encoding later
+    # df['opponent_id'] can be derived from home_team_id/away_team_id and player's team_id
 
-    # Create a scikit-learn pipeline
-    # This is a very basic example. Real pipelines would include more feature engineering,
-    # ColumnTransformer for different data types, etc.
-    pipeline = Pipeline([
-        ('scaler', StandardScaler()), # Example: scale numeric features
-        ('classifier', RandomForestClassifier(random_state=42)) # Example classifier
+    # Drop rows with NaNs created by shift/rolling, or impute them in preprocessor
+    # For simplicity here, we might rely on SimpleImputer in the pipeline
+    
+    logger.info("Feature engineering complete.")
+    return df
+
+def get_preprocessor(numerical_features: List[str], categorical_features: List[str]) -> ColumnTransformer:
+    """
+    Creates a scikit-learn ColumnTransformer for preprocessing.
+    """
+    numerical_transformer = Pipeline(steps=[
+        ('imputer', SimpleImputer(strategy='mean')),
+        ('scaler', StandardScaler())
     ])
 
-    logging.info("Fitting pipeline...")
-    pipeline.fit(X_train, y_train)
+    categorical_transformer = Pipeline(steps=[
+        ('imputer', SimpleImputer(strategy='most_frequent')), # Or 'constant' fill_value='missing'
+        ('onehot', OneHotEncoder(handle_unknown='ignore'))
+    ])
 
-    # Evaluate model
-    predictions = pipeline.predict(X_test)
-    acc = accuracy_score(y_test, predictions)
-    logging.info(f"Model accuracy on test set: {acc:.4f}")
-
-    return pipeline, acc # Return accuracy along with the pipeline
-
-def save_model(pipeline, db: Session, model_dir: Path, model_name_prefix: str, accuracy: Optional[float] = None):
-    """Saves the trained pipeline to a versioned file and creates a ModelVersion record in the DB."""
-    if pipeline is None:
-        logging.warning("No model to save.")
-        return None # Return None if no model was saved
-
-    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    model_filename = f"{model_name_prefix}_{timestamp}.joblib"
-    model_path = model_dir / model_filename
-    
-    logging.info(f"Saving model artifact to {model_path}")
-    joblib.dump(pipeline, model_path)
-    logging.info("Model artifact saved successfully.")
-
-    # Create ModelVersion entry in the database
-    model_version_data = model_version_schema.ModelVersionCreate(
-        version_name=model_filename, # Use the filename as the version name
-        description=f"RandomForestClassifier trained on {timestamp}. Accuracy: {accuracy if accuracy is not None else 'N/A'}. Path: {model_path}"
+    preprocessor = ColumnTransformer(
+        transformers=[
+            ('num', numerical_transformer, numerical_features),
+            ('cat', categorical_transformer, categorical_features)
+        ],
+        remainder='drop' # Or 'passthrough' if other columns are needed and handled
     )
-    try:
-        db_model_version = crud.create_model_version(db=db, model_version=model_version_data)
-        logging.info(f"Successfully created ModelVersion record with ID: {db_model_version.id} and Name: {db_model_version.version_name}")
-        return db_model_version # Return the created DB object
-    except Exception as e:
-        logging.error(f"Failed to create ModelVersion record in DB: {e}")
-        # Potentially consider what to do if file is saved but DB record fails
+    return preprocessor
+
+def train_and_evaluate_model(df: pd.DataFrame, target_stat: str):
+    """Trains a regression model and evaluates it using TimeSeriesSplit."""
+    logger.info(f"Starting model training and evaluation for {target_stat}...")
+    
+    if df.empty or target_stat not in df.columns:
+        logger.error(f"DataFrame is empty or target_stat '{target_stat}' column is missing. Skipping training.")
+        return None, None
+
+    # Ensure target is numeric and handle NaNs if any (should ideally be clean)
+    df = df.dropna(subset=[target_stat]) 
+    if df.empty:
+        logger.error(f"DataFrame empty after dropping NaNs in target '{target_stat}'. Skipping training.")
+        return None, None
+
+    y = df[target_stat]
+    # Define features: Exclude IDs, date/datetime, and the target itself
+    # Explicitly list features to be used or columns to be dropped
+    X = df.drop(columns=[target_stat, 'player_stat_id', 'player_id', 'game_id', 'game_datetime', 'player_name']) # Adjust as necessary
+
+    if X.empty:
+        logger.error("Feature set X is empty. Check feature engineering and column drops. Skipping training.")
+        return None, None
+
+    # Identify numerical and categorical features from X's columns
+    numerical_features = X.select_dtypes(include=np.number).columns.tolist()
+    categorical_features = X.select_dtypes(exclude=np.number).columns.tolist() # Or include=['object', 'category']
+
+    logger.info(f"Numerical features for preprocessing: {numerical_features}")
+    logger.info(f"Categorical features for preprocessing: {categorical_features}")
+
+    if not numerical_features and not categorical_features:
+        logger.error("No numerical or categorical features identified for the preprocessor. Skipping training.")
+        return None, None
+        
+    preprocessor = get_preprocessor(numerical_features, categorical_features)
+    
+    model = RandomForestRegressor(n_estimators=100, random_state=42, n_jobs=-1)
+    
+    pipeline = Pipeline(steps=[('preprocessor', preprocessor),
+                               ('regressor', model)])
+    
+    # Time-series split requires data to be sorted by time
+    # load_data already sorts by game_datetime, player_id. Ensure overall temporal order for split.
+    # If multiple players per game_datetime, this split is reasonable.
+    
+    tscv = TimeSeriesSplit(n_splits=5)
+    all_metrics = []
+
+    logger.info("Starting cross-validation with TimeSeriesSplit...")
+    for fold, (train_index, test_index) in enumerate(tscv.split(X)):
+        logger.info(f"Training on fold {fold+1}/5...")
+        X_train, X_test = X.iloc[train_index], X.iloc[test_index]
+        y_train, y_test = y.iloc[train_index], y.iloc[test_index]
+
+        if X_train.empty or y_train.empty:
+            logger.warning(f"Fold {fold+1} has empty training data. Skipping this fold.")
+            continue
+        
+        pipeline.fit(X_train, y_train)
+        predictions = pipeline.predict(X_test)
+
+        mse = mean_squared_error(y_test, predictions)
+        mae = mean_absolute_error(y_test, predictions)
+        r2 = r2_score(y_test, predictions)
+        all_metrics.append({'mse': mse, 'mae': mae, 'r2': r2})
+        logger.info(f"  Fold {fold+1} - MSE: {mse:.4f}, MAE: {mae:.4f}, R2: {r2:.4f}")
+
+    if not all_metrics:
+        logger.error("No cross-validation folds were successfully trained and evaluated.")
+        return None, None
+
+    # Aggregate metrics (e.g., average)
+    avg_metrics = {
+        'avg_mse': np.mean([m['mse'] for m in all_metrics]),
+        'avg_mae': np.mean([m['mae'] for m in all_metrics]),
+        'avg_r2': np.mean([m['r2'] for m in all_metrics])
+    }
+    logger.info(f"Average Cross-Validation Metrics for {target_stat}:")
+    logger.info(f"  Avg MSE: {avg_metrics['avg_mse']:.4f}")
+    logger.info(f"  Avg MAE: {avg_metrics['avg_mae']:.4f}")
+    logger.info(f"  Avg R2: {avg_metrics['avg_r2']:.4f}")
+
+    # Retrain on all data (or all but last fold for a final holdout)
+    logger.info(f"Retraining model on all available data for {target_stat}...")
+    pipeline.fit(X, y) # Retrain on the full dataset X, y
+    logger.info("Final model retraining complete.")
+
+    return pipeline, avg_metrics
+
+
+def save_model_artifact_and_metadata(db: Session, model_pipeline: Pipeline, target_stat: str, metrics: dict):
+    """Saves the trained pipeline and its metadata."""
+    if model_pipeline is None:
+        logger.warning("No model pipeline to save.")
         return None
 
-def main():
-    """Main function to orchestrate data loading, training, and saving."""
-    logging.info("Starting the model training pipeline...")
+    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    model_version_name = f"{target_stat}_model_v{timestamp}" # Incorporate target_stat
+    artifact_filename = f"{model_version_name}.joblib"
+    artifact_path = MODEL_ARTIFACTS_DIR / artifact_filename
     
-    db: Optional[Session] = None # Initialize db session variable
+    logger.info(f"Saving model artifact to {artifact_path}")
+    joblib.dump(model_pipeline, artifact_path)
+    logger.info("Model artifact saved successfully.")
+
+    # Create ModelVersion entry in the database
+    model_version_data = mv_schema.ModelVersionCreate(
+        version_name=model_version_name,
+        description=f"RandomForestRegressor for {target_stat}. Trained: {timestamp}. Avg Metrics: {metrics}",
+        model_path=str(artifact_path.relative_to(PROJECT_ROOT)), # Store relative path from project root
+        metrics=metrics, # Store the metrics dict
+        # parameters: Optional - can store model hyperparameters or feature list used
+    )
+    try:
+        # Use the imported crud_mv for creating model version
+        db_model_version = crud_mv.create_model_version(db=db, model_version=model_version_data)
+        logger.info(f"Successfully created ModelVersion record with ID: {db_model_version.id} and Name: {db_model_version.version_name}")
+        return db_model_version
+    except Exception as e:
+        logger.error(f"Failed to create ModelVersion record in DB: {e}", exc_info=True)
+        return None
+
+def main(args):
+    """Main function to orchestrate data loading, training, and saving."""
+    logger.info(f"Starting the model training pipeline for target_stat: {args.target_stat}...")
+    
+    db: Optional[Session] = None
     try:
         db = get_db_session()
-        # 1. Load data
-        df = load_data(DATA_PATH)
         
-        # 2. Train model
-        # Ensure train_model can handle df being potentially empty from load_data error state
-        if df.empty:
-            logging.error("Data loading failed or returned empty data. Skipping model training and saving.")
-            return # Exit main if no data
+        seasons_list = [int(s.strip()) for s in args.seasons.split(',')] if args.seasons else None
+        
+        df_raw = load_data(db, target_stat=args.target_stat, seasons=seasons_list)
+        
+        if df_raw.empty:
+            logger.error("Data loading returned empty DataFrame. Exiting pipeline.")
+            return
             
-        trained_pipeline_results = train_model(df)
-        
-        if trained_pipeline_results is None:
-            logging.warning("Model training did not produce a pipeline. Nothing to save.")
-            return # Exit main if no pipeline trained
+        df_featured = feature_engineering(df_raw.copy(), target_stat=args.target_stat)
 
-        trained_pipeline, accuracy = trained_pipeline_results
+        if df_featured.empty:
+            logger.error("DataFrame empty after feature engineering. Exiting pipeline.")
+            return
+
+        trained_pipeline, eval_metrics = train_and_evaluate_model(df_featured, args.target_stat)
         
-        # 3. Save model (and ModelVersion record)
-        if trained_pipeline:
-            saved_model_version = save_model(trained_pipeline, db, MODEL_DIR, MODEL_NAME_PREFIX, accuracy)
-            if saved_model_version:
-                logging.info(f"Model artifact and DB record saved successfully. Version: {saved_model_version.version_name}, Accuracy: {accuracy:.4f}")
-            else:
-                logging.warning("Model artifact saved, but failed to create ModelVersion DB record.")
+        if trained_pipeline and eval_metrics:
+            save_model_artifact_and_metadata(db, trained_pipeline, args.target_stat, eval_metrics)
+        else:
+            logger.warning("Model training or evaluation failed. Artifact not saved.")
             
     except Exception as e:
-        logging.error(f"An error occurred in the main training pipeline: {e}", exc_info=True)
+        logger.error(f"An error occurred in the main training pipeline: {e}", exc_info=True)
     finally:
         if db is not None:
-            logging.info("Closing database session.")
+            logger.info("Closing database session.")
             db.close()
         
-    logging.info("Model training pipeline finished.")
+    logger.info("Model training pipeline finished.")
 
 if __name__ == "__main__":
-    main() 
+    parser = argparse.ArgumentParser(description="Train a WNBA player stat prediction model.")
+    parser.add_argument("--target_stat", type=str, required=True, 
+                        help="The player statistic to predict (e.g., 'points', 'rebounds', 'assists'). Must be a column in PlayerStat model.")
+    parser.add_argument("--seasons", type=str, default=None,
+                        help="Optional comma-separated list of seasons (years) to train on (e.g., '2022,2023'). Defaults to all available if not specified in load_data.")
+    
+    cli_args = parser.parse_args()
+    main(cli_args) 

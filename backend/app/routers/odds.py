@@ -1,37 +1,77 @@
-from fastapi import APIRouter
-from typing import List
-from backend.schemas.odds import GameOdd, PlayerPropOdd 
-from datetime import datetime
+from fastapi import APIRouter, Depends, HTTPException
+from typing import List, Optional
+from sqlalchemy.orm import Session
+import uuid # Added import
+
+from schemas import odds as odds_schema # Use alias for Pydantic schemas
+from ..dependencies import get_db
+from .. import crud # Import the main crud module
 
 router = APIRouter(
     prefix="/api/odds",
     tags=["Betting Odds"],
 )
 
-# Placeholder data for now
-mock_game_odds_db = {
-    "GAME123": GameOdd(game_id="GAME123", home_team="Las Vegas Aces", away_team="New York Liberty", home_team_odds=-150, away_team_odds=130, spread=-3.5, over_under=165.5, source="MockSportsbook", last_updated=datetime.now()),
-}
+@router.get("/games", response_model=List[odds_schema.GameOddRead])
+async def read_all_game_odds(
+    skip: int = 0, 
+    limit: int = 100, 
+    game_id: Optional[uuid.UUID] = None,
+    db: Session = Depends(get_db)
+):
+    """Retrieve all available game odds, with optional filtering by game_id."""
+    game_odds_list = crud.get_game_odds(db, skip=skip, limit=limit, game_id=game_id)
+    if not game_odds_list:
+        return []
+    return game_odds_list
 
-mock_player_props_db = {
-    1: PlayerPropOdd(prop_id=1, player_id=1, player_name="A'ja Wilson", stat_type="points", line=24.5, over_odds=-110, under_odds=-110, source="MockSportsbook", last_updated=datetime.now()),
-}
+@router.get("/games/{game_odd_id}", response_model=odds_schema.GameOddRead)
+async def read_game_odd_by_id(game_odd_id: uuid.UUID, db: Session = Depends(get_db)):
+    """Retrieve specific game odds by its primary ID."""
+    db_game_odd = crud.get_game_odd(db, game_odd_id=game_odd_id)
+    if db_game_odd is None:
+        raise HTTPException(status_code=404, detail="Game odds not found")
+    return db_game_odd
 
-@router.get("/games", response_model=List[GameOdd])
-async def get_all_game_odds():
-    """Retrieve all available game odds."""
-    return list(mock_game_odds_db.values())
+@router.get("/props", response_model=List[odds_schema.PlayerPropRead])
+async def read_all_player_props(
+    skip: int = 0, 
+    limit: int = 100, 
+    game_id: Optional[uuid.UUID] = None,
+    player_id: Optional[uuid.UUID] = None,
+    db: Session = Depends(get_db)
+):
+    """Retrieve all player props, with optional filtering by game_id and player_id."""
+    player_props_list = crud.get_player_props(
+        db, skip=skip, limit=limit, game_id=game_id, player_id=player_id
+    )
+    if not player_props_list:
+        return []
+    return player_props_list
 
-@router.get("/games/{game_id}", response_model=GameOdd)
-async def get_game_odds_by_id(game_id: str):
-    """Retrieve odds for a specific game by its ID."""
-    if game_id in mock_game_odds_db:
-        return mock_game_odds_db[game_id]
-    return {"error": "Game odds not found"}
+@router.get("/props/{player_prop_id}", response_model=odds_schema.PlayerPropRead)
+async def read_player_prop_by_id(player_prop_id: uuid.UUID, db: Session = Depends(get_db)):
+    """Retrieve a specific player prop by its primary ID."""
+    db_player_prop = crud.get_player_prop(db, player_prop_id=player_prop_id)
+    if db_player_prop is None:
+        raise HTTPException(status_code=404, detail="Player prop not found")
+    return db_player_prop
 
-@router.get("/props/player/{player_id}", response_model=List[PlayerPropOdd])
-async def get_player_prop_odds(player_id: int):
-    """Retrieve all prop bets for a specific player."""
-    # This is a simplified example
-    results = [prop for prop in mock_player_props_db.values() if prop.player_id == player_id]
-    return results 
+# Example of a more specific endpoint, similar to what was there before:
+@router.get("/props/player/{player_id}", response_model=List[odds_schema.PlayerPropRead])
+async def read_player_props_for_player(
+    player_id: uuid.UUID, 
+    game_id: Optional[uuid.UUID] = None, # Optional filter by game
+    skip: int = 0, 
+    limit: int = 100, 
+    db: Session = Depends(get_db)
+):
+    """Retrieve all prop bets for a specific player, optionally filtered by game."""
+    player_props_list = crud.get_player_props(
+        db, player_id=player_id, game_id=game_id, skip=skip, limit=limit
+    )
+    if not player_props_list:
+        # Depending on desired behavior, could raise 404 if no props found for a player
+        # or return empty list if that's acceptable.
+        return [] 
+    return player_props_list 
