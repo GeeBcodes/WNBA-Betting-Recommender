@@ -1,4 +1,19 @@
-# Import and expose odds CRUD functions
+# Import and expose all asynchronous CRUD functions
+
+from .games import (
+    create_game,
+    get_game,
+    get_game_by_external_id,
+    get_games,
+)
+
+from .model_versions import (
+    create_model_version,
+    get_model_version,
+    get_model_version_by_name,
+    get_model_versions,
+)
+
 from .odds import (
     get_game_odd,
     get_game_odds,
@@ -6,17 +21,28 @@ from .odds import (
     get_player_props,
 )
 
-# Import and expose player_stats CRUD functions
+from .parlays import (
+    create_parlay,
+    get_parlay,
+    get_parlays,
+)
+
+from .players import (
+    create_player,
+    get_player,
+    get_player_by_api_id,
+    get_players,
+)
+
 from .player_stats import (
     get_player_stat,
     get_player_stats,
-    # Add other player_stat CRUD functions here if they are created, e.g.:
-    # create_player_stat,
-    # update_player_stat,
-    # delete_player_stat,
+    # Add other async player_stat CRUD functions here if they are created, e.g.:
+    # async_create_player_stat,
+    # async_update_player_stat,
+    # async_delete_player_stat,
 )
 
-# Import and expose predictions CRUD functions
 from .predictions import (
     create_prediction,
     get_prediction,
@@ -25,42 +51,13 @@ from .predictions import (
     get_predictions_by_model_version,
 )
 
-# Import and expose model_versions CRUD functions
-from .model_versions import (
-    create_model_version,
-    get_model_version,
-    get_model_version_by_name,
-    get_model_versions,
-)
 
-# Import and expose parlays CRUD functions
-from .parlays import (
-    create_parlay,
-    get_parlay,
-    get_parlays,
-)
-
-# Expose all CRUD functions that should be available via `from backend.app import crud`
 __all__ = [
-    # Odds
-    "get_game_odd",
-    "get_game_odds",
-    "get_player_prop",
-    "get_player_props",
-
-    # Player Stats
-    "get_player_stat",
-    "get_player_stats",
-    # "create_player_stat", 
-    # "update_player_stat",
-    # "delete_player_stat",
-
-    # Predictions
-    "create_prediction",
-    "get_prediction",
-    "get_predictions",
-    "get_predictions_by_player_prop",
-    "get_predictions_by_model_version",
+    # Games
+    "create_game",
+    "get_game",
+    "get_game_by_external_id",
+    "get_games",
 
     # Model Versions
     "create_model_version",
@@ -68,10 +65,36 @@ __all__ = [
     "get_model_version_by_name",
     "get_model_versions",
 
+    # Odds
+    "get_game_odd",
+    "get_game_odds",
+    "get_player_prop",
+    "get_player_props",
+
     # Parlays
     "create_parlay",
     "get_parlay",
     "get_parlays",
+
+    # Players
+    "create_player",
+    "get_player",
+    "get_player_by_api_id",
+    "get_players",
+
+    # Player Stats
+    "get_player_stat",
+    "get_player_stats",
+    # "async_create_player_stat", 
+    # "async_update_player_stat",
+    # "async_delete_player_stat",
+
+    # Predictions
+    "create_prediction",
+    "get_prediction",
+    "get_predictions",
+    "get_predictions_by_player_prop",
+    "get_predictions_by_model_version",
 ]
 
 # Placeholder for player_stats CRUD functions if they are directly in this file or need specific handling

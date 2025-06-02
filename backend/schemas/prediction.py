@@ -13,6 +13,11 @@ class PredictionBase(BaseModel):
     predicted_value: Optional[float] = None
     # predicted_line: Optional[float] = None
 
+    # New fields for actual outcomes
+    actual_value: Optional[float] = None
+    outcome: Optional[str] = None
+    outcome_processed_at: Optional[datetime] = None
+
     # Add model_config here to cover all schemas using model_version_id
     model_config = ConfigDict(
         protected_namespaces=()

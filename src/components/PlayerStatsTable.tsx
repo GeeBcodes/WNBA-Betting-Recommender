@@ -32,7 +32,11 @@ const PlayerStatsTable: React.FC = () => {
 
   const colDefs = useMemo<ColDef<PlayerStatFull>[]>(() => [
     { field: "player.player_name", headerName: "Player", filter: true, sortable: true, floatingFilter: true },
-    { field: "player.team_name", headerName: "Team", filter: true, sortable: true, floatingFilter: true },
+    {
+      headerName: "Team",
+      valueGetter: (params): string => params.data?.player?.team_name || 'N/A',
+      filter: true, sortable: true, floatingFilter: true
+    },
     {
       field: "game.game_datetime",
       headerName: "Game DateTime",
@@ -41,23 +45,28 @@ const PlayerStatsTable: React.FC = () => {
       valueFormatter: (params: ValueFormatterParams<PlayerStatFull, string | null | undefined>) => 
         params.value ? new Date(params.value).toLocaleString() : 'N/A',
     },
-    { field: "minutes_played", headerName: "MIN", sortable: true, filter: 'agNumberColumnFilter', aggFunc: 'avg' },
-    { field: "points", headerName: "PTS", sortable: true, filter: 'agNumberColumnFilter', aggFunc: 'avg' },
-    { field: "rebounds", headerName: "REB", sortable: true, filter: 'agNumberColumnFilter', aggFunc: 'avg' },
-    { field: "assists", headerName: "AST", sortable: true, filter: 'agNumberColumnFilter', aggFunc: 'avg' },
-    { field: "steals", headerName: "STL", sortable: true, filter: 'agNumberColumnFilter', aggFunc: 'avg' },
-    { field: "blocks", headerName: "BLK", sortable: true, filter: 'agNumberColumnFilter', aggFunc: 'avg' },
-    { field: "turnovers", headerName: "TOV", sortable: true, filter: 'agNumberColumnFilter', aggFunc: 'avg' },
-    { field: "field_goals_made", headerName: "FGM", sortable: true, filter: 'agNumberColumnFilter', aggFunc: 'avg' },
-    { field: "field_goals_attempted", headerName: "FGA", sortable: true, filter: 'agNumberColumnFilter', aggFunc: 'avg' },
-    { field: "three_pointers_made", headerName: "3PM", sortable: true, filter: 'agNumberColumnFilter', aggFunc: 'avg' },
-    { field: "three_pointers_attempted", headerName: "3PA", sortable: true, filter: 'agNumberColumnFilter', aggFunc: 'avg' },
-    { field: "free_throws_made", headerName: "FTM", sortable: true, filter: 'agNumberColumnFilter', aggFunc: 'avg' },
-    { field: "free_throws_attempted", headerName: "FTA", sortable: true, filter: 'agNumberColumnFilter', aggFunc: 'avg' },
-    { field: "plus_minus", headerName: "+/-", sortable: true, filter: 'agNumberColumnFilter', aggFunc: 'avg' },
+    { field: "minutes_played", headerName: "MIN", sortable: true, filter: 'agNumberColumnFilter' },
+    { field: "points", headerName: "PTS", sortable: true, filter: 'agNumberColumnFilter' },
+    { field: "rebounds", headerName: "REB", sortable: true, filter: 'agNumberColumnFilter' },
+    { field: "assists", headerName: "AST", sortable: true, filter: 'agNumberColumnFilter' },
+    { field: "steals", headerName: "STL", sortable: true, filter: 'agNumberColumnFilter' },
+    { field: "blocks", headerName: "BLK", sortable: true, filter: 'agNumberColumnFilter' },
+    { field: "turnovers", headerName: "TOV", sortable: true, filter: 'agNumberColumnFilter' },
+    { field: "field_goals_made", headerName: "FGM", sortable: true, filter: 'agNumberColumnFilter' },
+    { field: "field_goals_attempted", headerName: "FGA", sortable: true, filter: 'agNumberColumnFilter' },
+    { field: "three_pointers_made", headerName: "3PM", sortable: true, filter: 'agNumberColumnFilter' },
+    { field: "three_pointers_attempted", headerName: "3PA", sortable: true, filter: 'agNumberColumnFilter' },
+    { field: "free_throws_made", headerName: "FTM", sortable: true, filter: 'agNumberColumnFilter' },
+    { field: "free_throws_attempted", headerName: "FTA", sortable: true, filter: 'agNumberColumnFilter' },
+    { field: "plus_minus", headerName: "+/-", sortable: true, filter: 'agNumberColumnFilter' },
     {
       headerName: "Matchup",
-      valueGetter: (params): string => params.data ? `${params.data.game.away_team} @ ${params.data.game.home_team}` : 'N/A',
+      valueGetter: (params): string => {
+        const awayTeam = params.data?.game?.away_team || 'N/A';
+        const homeTeam = params.data?.game?.home_team || 'N/A';
+        if (awayTeam === 'N/A' && homeTeam === 'N/A') return 'N/A';
+        return `${awayTeam} @ ${homeTeam}`;
+      },
       filter: true, sortable: true, floatingFilter: true
     },
   ], []);

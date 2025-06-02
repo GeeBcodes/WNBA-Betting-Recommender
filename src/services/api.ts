@@ -93,13 +93,22 @@ export interface Prediction {
   player_prop?: PlayerProp | null; // Nested PlayerProp details
 }
 
+// Updated to match backend schemas/parlay.py ParlayCreate & ParlaySelectionDetail
+export interface ParlaySelectionDetailPayload {
+  prediction_id: string;
+  player_prop_id: string;
+  player_name: string;
+  market_key: string;
+  game_id: string;
+  line_point: number | null;
+  chosen_outcome: 'over' | 'under';
+  chosen_probability: number;
+}
+
 export interface ParlayData {
-  name: string;
-  legs: Array<{
-    prediction_id: string;
-    type: 'over' | 'under';
-  }>;
-  // Add other relevant fields for creating a parlay
+  selections: ParlaySelectionDetailPayload[];
+  combined_probability?: number | null;
+  total_odds?: number | null; 
 }
 
 export const getGames = async () => {
@@ -135,7 +144,8 @@ export const getOdds = async (gameId: string) => {
 // New functions for Phase 4
 export const getPredictions = async (): Promise<Prediction[]> => {
   try {
-    const response = await apiClient.get<Prediction[]>('/predictions');
+    // Explicitly request a larger limit
+    const response = await apiClient.get<Prediction[]>('/predictions?limit=500'); // Max limit as per backend
     return response.data;
   } catch (error) {
     console.error('Error fetching predictions:', error);
@@ -214,7 +224,8 @@ export interface PlayerStat {
 
 export const getPlayerStats = async (): Promise<PlayerStatFull[]> => { // Updated return type
   try {
-    const response = await apiClient.get<PlayerStatFull[]>("/api/stats"); // Updated generic type
+    // Request a larger number of records, e.g., 10000. Adjust as needed.
+    const response = await apiClient.get<PlayerStatFull[]>("/api/stats?limit=10000"); // Updated generic type
     return response.data;
   } catch (error) {
     console.error("Error fetching player stats:", error);

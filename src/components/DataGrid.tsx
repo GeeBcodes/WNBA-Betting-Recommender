@@ -32,7 +32,10 @@ const DataGrid: React.FC<DataGridProps> = ({ predictions, onSelectionChanged }) 
       headerName: "Game", 
       valueGetter: p => {
         const game = p.data?.player_prop?.game;
-        return game ? `${game.away_team} @ ${game.home_team}` : 'N/A';
+        const awayTeam = game?.away_team || 'N/A';
+        const homeTeam = game?.home_team || 'N/A';
+        if (awayTeam === 'N/A' && homeTeam === 'N/A') return 'N/A';
+        return `${awayTeam} @ ${homeTeam}`;
       }, 
       filter: true, 
       sortable: true, 

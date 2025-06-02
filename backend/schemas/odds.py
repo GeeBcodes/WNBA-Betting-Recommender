@@ -3,6 +3,9 @@ from typing import Optional, List, Dict, Any
 from datetime import datetime
 import uuid
 
+from .player import Player # Import Player schema
+from .game import Game # Import Game schema
+
 # --- Sport Schemas ---
 class SportBase(BaseModel):
     key: str
@@ -94,8 +97,8 @@ class PlayerProp(PlayerPropBase):
 class PlayerPropRead(PlayerProp):
     bookmaker: Optional[Bookmaker] = None
     market: Optional[Market] = None
-    # player: Optional[Player] # Assuming you have a Player schema in player.py
-    # game: Optional[Game] # Assuming you have a Game schema in game.py
+    player: Optional[Player] = None # Uncommented and using imported Player schema
+    game: Optional[Game] = None # Uncommented and using imported Game schema
 
 
 # Update __all__ in backend/schemas/__init__.py if you create it 

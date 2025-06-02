@@ -1,11 +1,12 @@
-import React from 'react';
-import { Line } from 'react-chartjs-2';
+import React, { useState } from 'react';
+import { Chart } from 'react-chartjs-2';
 import {
   Chart as ChartJS,
   CategoryScale,
   LinearScale,
   PointElement,
   LineElement,
+  BarElement,
   Title,
   Tooltip,
   Legend,
@@ -20,6 +21,7 @@ ChartJS.register(
   LinearScale,
   PointElement,
   LineElement,
+  BarElement,
   Title,
   Tooltip,
   Legend,
@@ -34,6 +36,8 @@ interface ChartProps {
 }
 
 const PlayerPerformanceChart: React.FC<ChartProps> = ({ playerStats, playerName, statToDisplay }) => {
+  const [bettingLineValue, setBettingLineValue] = useState<number | null>(null);
+
   const processedChartData = playerStats
     .filter(stat => {
       const statValue = stat[statToDisplay];
@@ -50,14 +54,29 @@ const PlayerPerformanceChart: React.FC<ChartProps> = ({ playerStats, playerName,
   }
 
   const chartData = {
+    labels: processedChartData.map(d => d.x),
     datasets: [
       {
+        type: 'bar' as const,
         label: `${playerName} - ${String(statToDisplay)}`,
         data: processedChartData,
-        fill: false,
+        backgroundColor: 'rgba(75, 192, 192, 0.5)',
         borderColor: 'rgb(75, 192, 192)',
+        borderWidth: 1,
+        fill: false,
         tension: 0.1,
       },
+      ...(bettingLineValue !== null ? [{
+        type: 'line' as const,
+        label: 'Betting Line',
+        data: processedChartData.map(d => ({ x: d.x, y: bettingLineValue })),
+        borderColor: 'rgb(255, 99, 132)',
+        borderWidth: 2,
+        borderDash: [5, 5],
+        pointRadius: 0,
+        fill: false,
+        tension: 0.1,
+      }] : [])
     ],
   };
 
@@ -101,7 +120,25 @@ const PlayerPerformanceChart: React.FC<ChartProps> = ({ playerStats, playerName,
     }
   };
 
-  return <Line options={options} data={chartData} />;
+  return (
+    <div>
+      <div style={{ marginBottom: '10px', display: 'flex', alignItems: 'center' }}>
+        <label htmlFor="betting-line-input" style={{ marginRight: '10px' }}>Betting Line:</label>
+        <input
+          type="number"
+          id="betting-line-input"
+          value={bettingLineValue === null ? '' : bettingLineValue}
+          onChange={(e) => {
+            const value = e.target.value;
+            setBettingLineValue(value === '' ? null : parseFloat(value));
+          }}
+          placeholder="Enter line (e.g., 15.5)"
+          style={{ padding: '5px' }}
+        />
+      </div>
+      <Chart type='bar' options={options} data={chartData} />
+    </div>
+  );
 };
 
 export default PlayerPerformanceChart; 

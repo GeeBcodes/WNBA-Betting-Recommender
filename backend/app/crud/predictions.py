@@ -1,13 +1,16 @@
+import sqlalchemy
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import select
 from sqlalchemy.orm import Session, joinedload, selectinload
 import uuid
 from typing import List, Optional
 from datetime import date
 
-from db import models
-from schemas import prediction as prediction_schema
+from backend.db import models
+from backend.schemas import prediction as prediction_schema
 
 # --- CRUD for Prediction ---
-def create_prediction(db: Session, prediction: prediction_schema.PredictionCreate) -> models.Prediction:
+async def create_prediction(db: AsyncSession, prediction: prediction_schema.PredictionCreate) -> models.Prediction:
     db_prediction = models.Prediction(
         player_prop_id=prediction.player_prop_id,
         model_version_id=prediction.model_version_id,
@@ -17,14 +20,13 @@ def create_prediction(db: Session, prediction: prediction_schema.PredictionCreat
         # prediction_datetime is default in model
     )
     db.add(db_prediction)
-    db.commit()
-    db.refresh(db_prediction)
-    db.refresh(db_prediction)
-    return get_prediction(db, db_prediction.id)
+    await db.commit()
+    await db.refresh(db_prediction)
+    return await get_prediction(db, db_prediction.id)
 
-def get_prediction(db: Session, prediction_id: uuid.UUID) -> Optional[models.Prediction]:
-    return (
-        db.query(models.Prediction)
+async def get_prediction(db: AsyncSession, prediction_id: uuid.UUID) -> Optional[models.Prediction]:
+    stmt = (
+        select(models.Prediction)
         .options(
             selectinload(models.Prediction.player_prop).selectinload(models.PlayerProp.player),
             selectinload(models.Prediction.player_prop).selectinload(models.PlayerProp.game),
@@ -33,11 +35,12 @@ def get_prediction(db: Session, prediction_id: uuid.UUID) -> Optional[models.Pre
             selectinload(models.Prediction.model_version)
         )
         .filter(models.Prediction.id == prediction_id)
-        .first()
     )
+    result = await db.execute(stmt)
+    return result.scalars().first()
 
-def get_predictions(
-    db: Session, 
+async def get_predictions(
+    db: AsyncSession, 
     skip: int = 0, 
     limit: int = 100, 
     game_date: Optional[date] = None,
@@ -46,9 +49,10 @@ def get_predictions(
     bookmaker_key: Optional[str] = None,
     market_key: Optional[str] = None
 ) -> List[models.Prediction]:
-    query = db.query(models.Prediction).options(
+    query = select(models.Prediction).options(
         selectinload(models.Prediction.player_prop).selectinload(models.PlayerProp.player),
-        selectinload(models.Prediction.player_prop).selectinload(models.PlayerProp.game),
+        selectinload(models.Prediction.player_prop).selectinload(models.PlayerProp.game).selectinload(models.Game.home_team_ref),
+        selectinload(models.Prediction.player_prop).selectinload(models.PlayerProp.game).selectinload(models.Game.away_team_ref),
         selectinload(models.Prediction.player_prop).selectinload(models.PlayerProp.market),
         selectinload(models.Prediction.player_prop).selectinload(models.PlayerProp.bookmaker),
         selectinload(models.Prediction.model_version)
@@ -76,11 +80,13 @@ def get_predictions(
                      .join(models.Market, models.PlayerProp.market_id == models.Market.id)\
                      .filter(models.Market.key == market_key)
 
-    return query.order_by(models.Prediction.prediction_datetime.desc()).offset(skip).limit(limit).all()
+    stmt = query.order_by(models.Prediction.prediction_datetime.desc()).offset(skip).limit(limit)
+    result = await db.execute(stmt)
+    return result.scalars().all()
 
-def get_predictions_by_player_prop(db: Session, player_prop_id: uuid.UUID, skip: int = 0, limit: int = 100) -> List[models.Prediction]:
-    return (
-        db.query(models.Prediction)
+async def get_predictions_by_player_prop(db: AsyncSession, player_prop_id: uuid.UUID, skip: int = 0, limit: int = 100) -> List[models.Prediction]:
+    stmt = (
+        select(models.Prediction)
         .options(
             selectinload(models.Prediction.player_prop).selectinload(models.PlayerProp.player),
             selectinload(models.Prediction.player_prop).selectinload(models.PlayerProp.game),
@@ -92,12 +98,13 @@ def get_predictions_by_player_prop(db: Session, player_prop_id: uuid.UUID, skip:
         .order_by(models.Prediction.prediction_datetime.desc())
         .offset(skip)
         .limit(limit)
-        .all()
     )
+    result = await db.execute(stmt)
+    return result.scalars().all()
 
-def get_predictions_by_model_version(db: Session, model_version_id: uuid.UUID, skip: int = 0, limit: int = 100) -> List[models.Prediction]:
-    return (
-        db.query(models.Prediction)
+async def get_predictions_by_model_version(db: AsyncSession, model_version_id: uuid.UUID, skip: int = 0, limit: int = 100) -> List[models.Prediction]:
+    stmt = (
+        select(models.Prediction)
         .options(
             selectinload(models.Prediction.player_prop).selectinload(models.PlayerProp.player),
             selectinload(models.Prediction.player_prop).selectinload(models.PlayerProp.game),
@@ -109,5 +116,6 @@ def get_predictions_by_model_version(db: Session, model_version_id: uuid.UUID, s
         .order_by(models.Prediction.prediction_datetime.desc())
         .offset(skip)
         .limit(limit)
-        .all()
-    ) 
+    )
+    result = await db.execute(stmt)
+    return result.scalars().all() 

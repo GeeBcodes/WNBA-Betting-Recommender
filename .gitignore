@@ -1,7 +1,6 @@
 .gitignore
-.cursor/mcp.json 
+backend\venv
 .cursor
-cursor_metrics.md
+.env
 documentation
-backend\db\session.py
 backend\venv
