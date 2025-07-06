@@ -1,36 +1,49 @@
-from pydantic import BaseModel, ConfigDict, validator, field_validator
-from typing import List, Optional, Any, Dict
-import uuid
+from pydantic import BaseModel, Field
+from typing import List
 from datetime import datetime
+import uuid
 
-# Details for each selection in a parlay
-class ParlaySelectionDetail(BaseModel):
-    prediction_id: str # Changed to str from uuid.UUID to match what parlay_builder might send as JSON
-    player_prop_id: str # Changed to str from uuid.UUID
-    player_name: str
-    market_key: str
-    game_id: str # Changed to str from uuid.UUID
-    line_point: Optional[float] = None
-    chosen_outcome: str # e.g., "Over", "Under"
-    chosen_probability: float
+# Base Schema for a Parlay Leg
+class ParlayLegBase(BaseModel):
+    parlay_id: uuid.UUID
+    prediction_id: uuid.UUID
+    model_version_id: uuid.UUID
+    leg_number: int
+    odds: float
+    bet_amount: float
+    status: str = Field(default='pending')
 
+
+class ParlayLegCreate(ParlayLegBase):
+    pass
+
+
+class ParlayLeg(ParlayLegBase):
+    id: uuid.UUID
+    created_at: datetime
+    
+    class Config:
+        from_attributes = True
+        protected_namespaces = ()
+
+
+# Base Schema for a Parlay
 class ParlayBase(BaseModel):
-    selections: List[ParlaySelectionDetail] # Store detailed selections
-    combined_probability: Optional[float] = None
-    total_odds: Optional[float] = None # Assuming decimal odds for now
+    user_id: uuid.UUID # Assuming a user model exists
+    total_odds: float
+    total_bet_amount: float
+    potential_payout: float
+    status: str = Field(default='pending')
 
-    model_config = ConfigDict(
-        protected_namespaces=() # Example, if needed later
-    )
 
 class ParlayCreate(ParlayBase):
     pass
 
+
 class Parlay(ParlayBase):
     id: uuid.UUID
     created_at: datetime
-
-    model_config = ConfigDict(
-        from_attributes=True,
-        protected_namespaces=() 
-    ) 
+    legs: List['ParlayLeg'] = []
+    
+    class Config:
+        from_attributes = True 

@@ -97,8 +97,46 @@ class PlayerProp(PlayerPropBase):
 class PlayerPropRead(PlayerProp):
     bookmaker: Optional[Bookmaker] = None
     market: Optional[Market] = None
-    player: Optional[Player] = None # Uncommented and using imported Player schema
-    game: Optional[Game] = None # Uncommented and using imported Game schema
+    player: Optional[Player] = None
+    game: Optional[Game] = None
 
 
 # Update __all__ in backend/schemas/__init__.py if you create it 
+
+# Base schema for a player betting market
+class PlayerMarketBase(BaseModel):
+    game_id: uuid.UUID
+    player_id: Optional[uuid.UUID] = None
+    bookmaker_id: uuid.UUID
+    market_id: uuid.UUID
+    player_name_api: Optional[str] = None
+    last_update_api: Optional[datetime] = None
+    outcomes: Optional[List[Dict[str, Any]]] = None
+
+class PlayerMarketCreate(PlayerMarketBase):
+    pass
+
+class PlayerMarket(PlayerMarketBase):
+    id: uuid.UUID
+    
+    class Config:
+        from_attributes = True
+
+
+# Base schema for game-level odds (e.g., moneyline, spread)
+class GameOddsBase(BaseModel):
+    game_id: uuid.UUID
+    bookmaker_id: uuid.UUID
+    market_id: uuid.UUID
+    last_update_api: Optional[datetime] = None
+    outcomes: Optional[List[Dict[str, Any]]] = None
+
+class GameOddsCreate(GameOddsBase):
+    pass
+
+class GameOdds(GameOddsBase):
+    id: uuid.UUID
+    player_markets: List[PlayerMarket] = []
+
+    class Config:
+        from_attributes = True 

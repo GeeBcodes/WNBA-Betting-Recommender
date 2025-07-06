@@ -5,9 +5,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 import uuid
 from datetime import date
 
-from schemas import player_stats as player_stat_schema
-from ..dependencies import get_db
-from .. import crud
+from backend.schemas import player_stats as player_stat_schema
+from backend.app.dependencies import get_db
+from backend.app import crud
 
 router = APIRouter(
     prefix="/api/stats",

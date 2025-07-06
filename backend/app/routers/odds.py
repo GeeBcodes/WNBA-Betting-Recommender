@@ -4,9 +4,9 @@ from sqlalchemy.orm import Session
 from sqlalchemy.ext.asyncio import AsyncSession
 import uuid # Added import
 
-from schemas import odds as odds_schema # Use alias for Pydantic schemas
-from ..dependencies import get_db
-from .. import crud # Import the main crud module
+from backend.schemas import odds as odds_schema # Use alias for Pydantic schemas
+from backend.app.dependencies import get_db
+from backend.app import crud # Import the main crud module
 
 router = APIRouter(
     prefix="/api/odds",

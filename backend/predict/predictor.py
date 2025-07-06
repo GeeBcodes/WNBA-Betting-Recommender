@@ -1,514 +1,537 @@
-import sys
-import os
 import argparse
+import asyncio
 import logging
-from pathlib import Path
-import datetime
-from typing import Optional, List, Dict, Any, Tuple
-import re
+from datetime import datetime, timezone
+import os
+import pickle
+from typing import Any, Dict, List, Optional, Tuple
 import uuid
-
-# Add project root to sys.path
-PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
-sys.path.insert(0, PROJECT_ROOT)
-
-import pandas as pd
-import numpy as np
+import traceback
 import joblib
-from sqlalchemy.orm import Session, joinedload
-from sqlalchemy import func, desc, String
+from pathlib import Path
 
-from backend.db.session import SessionLocal
+import numpy as np
+import pandas as pd
+from sqlalchemy import delete, select, func, or_, and_
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import joinedload
+
+# Make sure to add project root to sys.path if running as a script
+import sys
+PROJECT_ROOT_FROM_SCRIPT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
+if PROJECT_ROOT_FROM_SCRIPT not in sys.path:
+    sys.path.insert(0, PROJECT_ROOT_FROM_SCRIPT)
+
+
+from backend.db.session import get_async_db_session as get_session
 from backend.db import models as db_models
-from backend.app.crud import predictions as crud_predictions
-from backend.schemas import prediction as prediction_schema
-# Placeholder for feature engineering logic, to be imported or defined
-# from backend.models.train_model import feature_engineering, get_preprocessor # Or copy relevant parts
-
-# Import the new shared feature engineering function
+from backend.app.crud import predictions as crud_predictions, model_versions as crud_model_versions
+from backend.schemas.prediction import PredictionCreate
+from backend.features.feature_engineering_core import (
+    generate_full_feature_set,
+    get_team_defensive_rolling_averages,
+    get_team_performance_rolling_averages,
+)
+from backend.app.core.config import (
+    DEFAULT_PROP_MARKET_TO_STAT_MAP,
+    ROLLING_WINDOWS
+)
+from backend.app.dependencies import get_db
+from backend.app.core.config import DEFAULT_PROP_MARKET_TO_STAT_MAP
 from backend.features.feature_engineering_core import generate_full_feature_set
-# Temporary: Import data prep functions from train_model. Will be refactored.
-from backend.models.train_model import get_team_defensive_rolling_averages, get_team_performance_rolling_averages 
-# Aliasing to avoid potential conflicts if predictor.py also had a get_db_session
-from backend.models.train_model import get_db_session as get_train_db_session_for_feature_helpers 
+
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-MODEL_ARTIFACTS_DIR = Path(PROJECT_ROOT) / "backend" / "models" / "artifacts"
+PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
+MODELS_DIR = PROJECT_ROOT
 
-def get_db_session() -> Session:
-    db = SessionLocal()
-    try:
-        return db
-    except Exception as e:
-        logger.error(f"Error creating database session: {e}")
-        if db:
-            db.close()
-        raise
 
-def get_market_key_to_target_stat_map() -> Dict[str, str]:
-    """Returns a mapping from market_key prefixes to target_stat names."""
-    # This can be expanded as more player prop markets are handled
-    return {
-        "player_points": "points",
-        "player_rebounds": "rebounds",
-        "player_assists": "assists",
-        "player_steals": "steals",
-        "player_blocks": "blocks",
-        "player_turnovers": "turnovers",
-        "player_threes": "three_pointers_made", # Assuming model trained on three_pointers_made
-        # Add mappings for other stats like PRA, P+R, P+A, R+A if models are trained for them
-        # e.g., "player_pra": "pra" (if 'pra' is a column in PlayerStat or a target for a model)
-    }
-
-def map_market_key_to_target_stat(market_key: str) -> Optional[str]:
-    """Maps a market key (e.g., player_points_over_under) to a target_stat (e.g., points)."""
-    mapping = get_market_key_to_target_stat_map()
-    for prefix, stat_name in mapping.items():
-        if market_key.startswith(prefix):
-            return stat_name
-    logger.warning(f"No target_stat mapping found for market_key: {market_key}")
-    return None
-
-def get_upcoming_player_props(db: Session, game_date_cutoff: Optional[datetime.date] = None) -> List[db_models.PlayerProp]:
-    """Fetches player props for upcoming games."""
-    if game_date_cutoff is None:
-        game_date_cutoff = datetime.date.today()
-
-    logger.info(f"Fetching upcoming player props for games on or after {game_date_cutoff}...")
+# --- Model Loading ---
+async def load_model_artifacts(db: AsyncSession, model_name_prefix: str, model_type: str) -> Optional[Tuple[Any, Any, Any, Any]]:
+    """Loads the latest model pipeline, ICP scores, and feature names from the database."""
+    logger.info(f"Loading latest model artifacts for model type '{model_type}' with prefix: {model_name_prefix}")
     
-    query = (
-        db.query(db_models.PlayerProp)
-        .join(db_models.Game, db_models.PlayerProp.game_id == db_models.Game.id)
+    version_name_pattern = f"{model_name_prefix}_{model_type}"
+    
+    latest_version = await crud_model_versions.get_latest_model_version_by_prefix(db, prefix=version_name_pattern)
+    
+    if not latest_version:
+        logger.warning(f"No model version found in DB matching pattern '{version_name_pattern}%'")
+        return None, None, None, None
+
+    logger.info(f"Found latest model version: {latest_version.version_name}")
+
+    try:
+        pipeline = joblib.load(latest_version.model_path)
+        
+        icp_scores_path = None
+        if model_type == 'regression':
+            icp_scores_path = latest_version.nonconformity_scores_path
+        elif model_type == 'classification':
+            icp_scores_path = latest_version.nonconformity_scores_clf_path
+            
+        icp_scores = joblib.load(icp_scores_path) if icp_scores_path and os.path.exists(icp_scores_path) else None
+
+        # Load the clean feature names directly from the database record
+        feature_names = latest_version.feature_names
+
+        return pipeline, icp_scores, feature_names, latest_version.id
+    except FileNotFoundError as e:
+        logger.error(f"Error loading model artifacts for {latest_version.version_name}: {e}")
+        return None, None, None, None
+    except Exception as e:
+        logger.error(f"A general error occurred loading artifacts for {latest_version.version_name}: {e}")
+        return None, None, None, None
+
+
+# --- ICP Prediction Logic ---
+def get_regression_interval(
+    point_prediction: float,
+    nonconformity_scores: np.ndarray,
+    confidence_level: float = 0.9,
+) -> Tuple[Optional[float], Optional[float]]:
+    """
+    Generates a conformal prediction interval for a regression model.
+    """
+    if point_prediction is None or nonconformity_scores is None:
+        return None, None
+        
+    try:
+        q_value = np.quantile(
+            nonconformity_scores,
+            min(1.0, confidence_level)
+        )
+        
+        lower_bound = point_prediction - q_value
+        upper_bound = point_prediction + q_value
+        
+        return max(0, lower_bound), upper_bound
+    except Exception as e:
+        logger.error(f"Error during regression interval calculation: {e}")
+        logger.error(traceback.format_exc())
+        return None, None
+
+
+def get_classification_p_values(
+    probas: np.ndarray,
+    nonconformity_scores: np.ndarray,
+) -> Tuple[Optional[float], Optional[float]]:
+    """
+    Calculates calibrated p-values for Over/Under outcomes.
+    """
+    if probas is None or nonconformity_scores is None:
+        return None, None
+        
+    try:
+        # Assuming class 0 is Under, class 1 is Over
+        p_under, p_over = probas[0], probas[1]
+
+        alpha_under = 1 - p_under
+        alpha_over = 1 - p_over
+        
+        p_value_under = (np.sum(nonconformity_scores >= alpha_under) + 1) / (len(nonconformity_scores) + 1)
+        p_value_over = (np.sum(nonconformity_scores >= alpha_over) + 1) / (len(nonconformity_scores) + 1)
+        
+        return p_value_under, p_value_over
+    except Exception as e:
+        logger.error(f"Error during classification p-value calculation: {e}")
+        logger.error(traceback.format_exc())
+        return None, None
+
+
+async def make_predictions_for_props(db: AsyncSession, predictions_for_csv: List[Dict[str, Any]]):
+    logger.info("Fetching upcoming player props for games on or after today...")
+    
+    today = datetime.now(timezone.utc).date()
+    
+    stmt = (
+        select(db_models.PlayerProp)
         .options(
-            joinedload(db_models.PlayerProp.player),
-            joinedload(db_models.PlayerProp.game).joinedload(db_models.Game.home_team_ref),
-            joinedload(db_models.PlayerProp.game).joinedload(db_models.Game.away_team_ref),
-            joinedload(db_models.PlayerProp.market),
-            joinedload(db_models.PlayerProp.bookmaker)
+                    joinedload(db_models.PlayerProp.game)
+                    .joinedload(db_models.Game.home_team_ref),
+                    joinedload(db_models.PlayerProp.game)
+                    .joinedload(db_models.Game.away_team_ref),
+                    joinedload(db_models.PlayerProp.player),
+                    joinedload(db_models.PlayerProp.market)
         )
-        .filter(db_models.Game.game_datetime >= datetime.datetime.combine(game_date_cutoff, datetime.time.min))
-        .order_by(db_models.Game.game_datetime, db_models.PlayerProp.player_id)
+        .join(db_models.Game, db_models.PlayerProp.game_id == db_models.Game.id)
+        .where(func.date(db_models.Game.game_datetime) >= today)
     )
+    result = await db.execute(stmt)
+    props_to_predict = result.scalars().unique().all()
     
-    player_props = query.all()
-    logger.info(f"Found {len(player_props)} upcoming player props.")
-    return player_props
+    logger.info(f"Found {len(props_to_predict)} upcoming player props.")
 
-def load_latest_model_for_target_stat(db: Session, target_stat: str) -> Optional[Tuple[Any, db_models.ModelVersion]]:
-    logger.info(f"Attempting to load latest model for target_stat: {target_stat}")
-    latest_model_version = (
-        db.query(db_models.ModelVersion)
-        .filter(db_models.ModelVersion.version_name.like(f"{target_stat}_model_v%"))
-        .order_by(desc(db_models.ModelVersion.trained_at))
-        .first()
-    )
-    if not latest_model_version:
-        logger.warning(f"No model version found in DB for target_stat: {target_stat}")
-        return None, None
-    if not latest_model_version.model_path:
-        logger.error(f"ModelVersion {latest_model_version.version_name} has no model_path defined.")
-        return None, None
-    model_full_path = Path(PROJECT_ROOT) / latest_model_version.model_path
-    if not model_full_path.exists():
-        logger.error(f"Model artifact not found at path: {model_full_path} for ModelVersion: {latest_model_version.version_name}")
-        return None, None
-    try:
-        model_pipeline = joblib.load(model_full_path)
-        logger.info(f"Successfully loaded model: {latest_model_version.version_name} from {model_full_path}")
-        return model_pipeline, latest_model_version
-    except Exception as e:
-        logger.error(f"Error loading model artifact from {model_full_path}: {e}", exc_info=True)
-        return None, None
-
-    def engineer_features_for_prediction(
-        db: Session,
-        player_id_uuid: uuid.UUID,
-        game_id_uuid: uuid.UUID,
-        game_datetime: datetime.datetime,
-        target_stat: str,
-        home_team_name_prop: str,
-        away_team_name_prop: str,
-        is_player_home_prop: bool
-    ) -> Optional[pd.DataFrame]:
-        player_id_str = str(player_id_uuid)
-        logger.info(f"Starting feature engineering for player {player_id_str}, game {str(game_id_uuid)} ({game_datetime.strftime('%Y-%m-%d %H:%M')}), target: {target_stat}")
-
-        # 1. Construct base_df (historical data + current game row)
-        HomeTeamAliased = db_models.aliased(db_models.Team, name='hist_home_team_pred')
-        AwayTeamAliased = db_models.aliased(db_models.Team, name='hist_away_team_pred')
-
-    historical_stats_query = (
-        db.query(
-                db_models.PlayerStat.player_id.cast(String).label('player_id'),
-                db_models.Game.game_datetime,
-                getattr(db_models.PlayerStat, target_stat).label(target_stat),
-            db_models.PlayerStat.minutes_played,
-                db_models.PlayerStat.is_home_team,
-                HomeTeamAliased.team_name.label('home_team_name'),
-                AwayTeamAliased.team_name.label('away_team_name'),
-                db_models.Game.season,
-                db_models.PlayerStat.game_id.cast(String).label('game_id')
-        )
-        .join(db_models.Game, db_models.PlayerStat.game_id == db_models.Game.id)
-            .join(HomeTeamAliased, db_models.Game.home_team_id == HomeTeamAliased.id)
-            .join(AwayTeamAliased, db_models.Game.away_team_id == AwayTeamAliased.id)
-        .filter(db_models.PlayerStat.player_id == player_id_uuid)
-        .filter(db_models.Game.game_datetime < game_datetime)
-            .order_by(db_models.Game.game_datetime.asc())
-    )
-    hist_df = pd.read_sql_query(historical_stats_query.statement, db.bind)
-    
-    if not hist_df.empty:
-            hist_df['game_datetime'] = pd.to_datetime(hist_df['game_datetime'], utc=True)
-    else:
-            logger.info(f"No historical stats for player {player_id_str} before {game_datetime}.")
-
-        upcoming_game_db_details = db.query(db_models.Game.season).filter(db_models.Game.id == game_id_uuid).first()
-        current_game_season = upcoming_game_db_details.season if upcoming_game_db_details else datetime.datetime.now(datetime.timezone.utc).year
-
-    current_game_data = {
-        'player_id': player_id_str,
-            'game_datetime': pd.to_datetime(game_datetime, utc=True),
-        target_stat: np.nan,
-        'minutes_played': np.nan,
-            'is_home_team': is_player_home_prop,
-            'home_team_name': home_team_name_prop,
-            'away_team_name': away_team_name_prop,
-            'season': current_game_season,
-            'game_id': str(game_id_uuid)
-    }
-    current_game_df_row = pd.DataFrame([current_game_data])
-
-    if not hist_df.empty:
-            base_df_for_features = pd.concat([hist_df, current_game_df_row], ignore_index=True)
-    else:
-            base_df_for_features = current_game_df_row
-
-        # Ensure all columns expected by generate_full_feature_set are present
-        expected_base_cols = ['player_id', 'game_datetime', target_stat, 'minutes_played',
-                              'is_home_team', 'home_team_name', 'away_team_name', 'season', 'game_id']
-        for col in expected_base_cols:
-            if col not in base_df_for_features.columns:
-                base_df_for_features[col] = np.nan
-        
-        base_df_for_features = base_df_for_features.sort_values(by=['player_id', 'game_datetime'])
-
-        # --- Logic to populate opponent_defense_df and team_performance_df ---
-        logger.info(f"Fetching additional historical data for team rolling averages for game {str(game_id_uuid)} up to {game_datetime}")
-        
-        # Determine the season of the game to be predicted
-        # current_game_season is already available from earlier in the function.
-        
-        # Fetch broader historical data for the current game's season up to the game's datetime
-        # This data will be used for calculating team-level rolling averages.
-        # We need columns: game_id, game_datetime, is_home_team, home_team_name, away_team_name, target_stat value, points value for all players.
-        PredictionContextHomeTeam = db_models.aliased(db_models.Team, name='pred_ctx_home_team')
-        PredictionContextAwayTeam = db_models.aliased(db_models.Team, name='pred_ctx_away_team')
-
-        # Define the columns to query for the context data
-        context_query_cols = [
-            db_models.PlayerStat.game_id,
-            db_models.PlayerStat.is_home_team,
-            db_models.Game.game_datetime,
-            PredictionContextHomeTeam.team_name.label('game_home_team_name'), # Renamed to avoid clash if base_df had these
-            PredictionContextAwayTeam.team_name.label('game_away_team_name'), # Renamed to avoid clash
-            getattr(db_models.PlayerStat, target_stat).label(target_stat),
-            db_models.PlayerStat.points
-        ]
-        if target_stat == 'points': # Avoid duplicate 'points' column
-            context_query_cols.pop(-2)
-
-        historical_context_query = (
-            db.query(*context_query_cols)
-            .join(db_models.Game, db_models.PlayerStat.game_id == db_models.Game.id)
-            .join(PredictionContextHomeTeam, db_models.Game.home_team_id == PredictionContextHomeTeam.id)
-            .join(PredictionContextAwayTeam, db_models.Game.away_team_id == PredictionContextAwayTeam.id)
-            .filter(db_models.Game.season == current_game_season)
-            .filter(db_models.Game.game_datetime < game_datetime) # Only games *before* the one we're predicting for
-            .filter(getattr(db_models.PlayerStat, target_stat).isnot(None))
-            .filter(db_models.PlayerStat.points.isnot(None))
-            .order_by(db_models.Game.game_datetime.asc())
-        )
-        
-        historical_team_context_df = pd.read_sql_query(historical_context_query.statement, db.bind)
-
-        if not historical_team_context_df.empty:
-            historical_team_context_df['game_datetime'] = pd.to_datetime(historical_team_context_df['game_datetime'], utc=True)
-            logger.info(f"Fetched {len(historical_team_context_df)} records for team context for season {current_game_season}.")
-            
-            # Prepare opponent defensive stats
-            # The function get_team_defensive_rolling_averages expects a db session and seasons list.
-            # For prediction, we are providing data up to a point in time.
-            # We need to adapt its usage or re-implement its core logic for this context.
-            # For now, let's assume we can call it by passing the *current* db session,
-            # and the `historical_team_context_df` can be processed by a similar logic as inside that function.
-            # This part requires careful adaptation of how get_team_defensive_rolling_averages is called or used.
-            # The original function queries DB. Here we give it a DF.
-            # Let's call the original function, it will re-query but filtered by season. This might be acceptable for now.
-            
-            opponent_defense_df_for_pred = get_team_defensive_rolling_averages(
-                db=db, # db is still needed for the fallback case within the function
-                target_stat=target_stat, 
-                seasons=[current_game_season], # seasons is also for fallback or if function uses it internally
-                all_player_stats_df=historical_team_context_df.copy() # Pass the DataFrame
-            )
-            # The result of get_team_defensive_rolling_averages needs to be shifted for prediction time.
-            # The function itself applies a shift(1). We need to ensure game_ids from opponent_defense_df_for_pred are aligned or game_datetime.
-            # And we only need the values *before* the current game_datetime.
-            if opponent_defense_df_for_pred is not None and not opponent_defense_df_for_pred.empty:
-                opponent_defense_df_for_pred['game_datetime'] = pd.to_datetime(opponent_defense_df_for_pred['game_datetime'], utc=True)
-                # Filter to include data strictly before the current game's datetime
-                opponent_defense_df_for_pred = opponent_defense_df_for_pred[opponent_defense_df_for_pred['game_datetime'] < game_datetime].copy()
-
-
-            team_performance_df_for_pred = get_team_performance_rolling_averages(
-                db=db, # Uses the existing db session
-                target_stat=target_stat,
-                all_player_stats_df_for_points=historical_team_context_df.copy(), # Pass the df we just fetched
-                seasons=[current_game_season]
-            )
-            if team_performance_df_for_pred is not None and not team_performance_df_for_pred.empty:
-                team_performance_df_for_pred['game_datetime'] = pd.to_datetime(team_performance_df_for_pred['game_datetime'], utc=True)
-                team_performance_df_for_pred = team_performance_df_for_pred[team_performance_df_for_pred['game_datetime'] < game_datetime].copy()
-
-        else:
-            logger.warning(f"No historical team context data found for season {current_game_season} before {game_datetime}. Rolling averages for opponent/team will be NaN or missing.")
-            opponent_defense_df_for_pred = pd.DataFrame() # Empty DataFrame
-            team_performance_df_for_pred = pd.DataFrame()   # Empty DataFrame
-        
-        # --- THIS IS THE KEY CHANGE FOR THIS STEP ---
-        # For now, we pass None for the team-based rolling average DataFrames.
-        # The logic to populate these for the prediction context will be added next.
-        # opponent_defense_df_for_pred = None # Now populated above
-        # team_performance_df_for_pred = None # Now populated above
-        # logger.warning("TEMPORARY: Passing None for opponent_defense_df and team_performance_df in predictor.")
-        # --- END KEY CHANGE ---
-
-        all_features_df = generate_full_feature_set(
-            base_df=base_df_for_features,
-            target_stat=target_stat,
-            opponent_defense_df=opponent_defense_df_for_pred,
-            team_performance_df=team_performance_df_for_pred
-        )
-
-        if all_features_df.empty:
-            logger.warning(f"Feature generation returned empty DataFrame for player {player_id_str}, game {str(game_id_uuid)}.")
-            return None
-
-        prediction_features_row = all_features_df.iloc[-1:].copy()
-        logger.info(f"Engineered features for player {player_id_str}, game {str(game_id_uuid)}. Shape: {prediction_features_row.shape}")
-        return prediction_features_row
-
-def calculate_probabilities(predicted_value: float, line: float, model_mse: Optional[float]) -> tuple[Optional[float], Optional[float]]:
-    """
-    Calculates over/under probabilities.
-    Uses normal distribution assumption if model_mse is provided.
-    """
-    try:
-        import scipy.stats
-    except ImportError:
-        logger.error("Scipy is not installed. Probabilities will be estimated using fallback.")
-        # Fallback simple logic if scipy is not available
-        if predicted_value > line:
-            return 0.75, 0.25 
-        elif predicted_value < line:
-            return 0.25, 0.75
-        else:
-            return 0.5, 0.5
-
-    if model_mse is not None and model_mse > 0:
-        std_dev = np.sqrt(model_mse)
-        if std_dev > 1e-6: # Check for practically non-zero std_dev to avoid division by zero or instability
-            z = (line - predicted_value) / std_dev
-            prob_over = 1 - scipy.stats.norm.cdf(z)
-            prob_under = scipy.stats.norm.cdf(z) 
-            return float(prob_over), float(prob_under)
-        else:
-            logger.warning(f"Standard deviation is too small ({std_dev:.2e}) from MSE ({model_mse:.2e}). Falling back to simple probability estimation.")
-    elif model_mse is not None and model_mse <= 0:
-        logger.warning(f"Model MSE ({model_mse}) is not positive. Falling back to simple probability estimation.")
-    else: # model_mse is None
-        logger.warning("Model MSE not provided. Falling back to simple probability estimation.")
-    
-    # Fallback simple logic if MSE is not suitable or not available
-    if predicted_value > line:
-        return 0.75, 0.25
-    elif predicted_value < line:
-        return 0.25, 0.75
-    else:
-        return 0.5, 0.5
-
-def parse_line_from_outcomes(outcomes: List[Dict[str, Any]]) -> Optional[float]:
-    """Parses the betting line (point) from the outcomes JSON."""
-    if not outcomes or not isinstance(outcomes, list):
-        return None
-    # Assuming the line is consistent across Over/Under outcomes
-    for outcome in outcomes:
-        if isinstance(outcome, dict) and 'point' in outcome:
-            return float(outcome['point'])
-    return None
-
-def make_predictions_for_props(db: Session, player_props: List[db_models.PlayerProp]):
-    if not player_props:
-        logger.info("No player props provided to make_predictions_for_props.")
+    if not props_to_predict:
         return
 
-    props_by_stat: Dict[str, List[db_models.PlayerProp]] = {}
-    for prop in player_props:
-        target_stat = map_market_key_to_target_stat(prop.market.key)
-        if target_stat:
-            if target_stat not in props_by_stat:
-                props_by_stat[target_stat] = []
-            props_by_stat[target_stat].append(prop)
+    all_predictions_to_create = []
 
-    for target_stat, props_for_stat in props_by_stat.items():
-        logger.info(f"Processing {len(props_for_stat)} props for target_stat: {target_stat}")
-        model_pipeline, model_version = load_latest_model_for_target_stat(db, target_stat)
+    # Cache historical stats per game date to avoid re-fetching
+    historical_stats_cache = {}
 
-        if not model_pipeline or not model_version:
-            logger.warning(f"Skipping predictions for {target_stat} due to missing model.")
-            continue
-        
-        model_mse = None
-        if model_version.metrics:
-            model_mse = model_version.metrics.get('best_cv_mse', model_version.metrics.get('avg_mse')) 
-        if model_mse is None:
-            logger.warning(f"MSE not found in metrics for model {model_version.version_name}. Probabilities will be estimated.")
-
-        for prop_to_predict in props_for_stat:
-            if not (prop_to_predict.player and prop_to_predict.game and prop_to_predict.game.home_team_ref and prop_to_predict.game.away_team_ref):
-                logger.warning(f"Prop ID {prop_to_predict.id} is missing player, game, or game team references. Skipping.")
-                continue
-
-            logger.info(f"Predicting for Prop ID: {prop_to_predict.id}, Player: {prop_to_predict.player.player_name}, Game: {prop_to_predict.game.game_datetime}, Market: {prop_to_predict.market.key}")
-
-            game_obj = prop_to_predict.game
-            player_obj = prop_to_predict.player
-            is_player_home = False
-            if player_obj.team_id and game_obj.home_team_id:
-                if player_obj.team_id == game_obj.home_team_id:
-                    is_player_home = True
-            else:
-                logger.warning(f"Could not reliably determine if player {player_obj.player_name} is home for prop {prop_to_predict.id}. Defaulting to False.")
+    for prop in props_to_predict:
+        try:
+            game_date = prop.game.game_datetime.date()
+            home_team_id = prop.game.home_team_id
+            away_team_id = prop.game.away_team_id
             
-            game_home_team_name = game_obj.home_team
-            game_away_team_name = game_obj.away_team
-
-            if not game_home_team_name or not game_away_team_name:
-                logger.warning(f"Home or away team name missing for game ID {game_obj.id}. Skipping prop {prop_to_predict.id}")
-                continue
+            # --- NEW: Find the scraper-generated game_id ---
+            game_day = prop.game.game_datetime.date()
             
-            features_df = engineer_features_for_prediction(
-                db,
-                prop_to_predict.player_id,
-                prop_to_predict.game_id,
-                prop_to_predict.game.game_datetime,
-                target_stat,
-                home_team_name_prop=game_home_team_name,
-                away_team_name_prop=game_away_team_name,
-                is_player_home_prop=is_player_home
+            stmt = select(db_models.Game).where(
+                and_(
+                    func.date(db_models.Game.game_datetime) == game_day,
+                    db_models.Game.home_team_id == home_team_id,
+                    db_models.Game.away_team_id == away_team_id,
+                    db_models.Game.the_odds_api_game_id.isnot(None)
+                )
             )
+            result = await db.execute(stmt)
+            scraper_game = result.scalars().first()
 
-            if features_df is None or features_df.empty:
-                logger.warning(f"Could not engineer features for prop ID {prop_to_predict.id} (placeholder in engineer_features_for_prediction). Skipping prediction.")
-                continue
-            
-            try:
-                predicted_stat_value = model_pipeline.predict(features_df)[0] 
-                logger.info(f"Raw model prediction for {target_stat} for player {player_obj.player_name}: {predicted_stat_value:.2f}")
-            except Exception as e:
-                logger.error(f"Error during model prediction for prop {prop_to_predict.id}: {e}", exc_info=True)
-                logger.debug(f"Features DataFrame that caused error:\n{features_df.to_string()}")
+            if not scraper_game:
+                logger.warning(f"Could not find a scraper-generated game match for prop's game {prop.game_id} on {game_day}. Skipping prop.")
                 continue
 
-            betting_line = parse_line_from_outcomes(prop_to_predict.outcomes)
-            if betting_line is None:
-                logger.warning(f"Could not parse betting line for prop {prop_to_predict.id}. Skipping.")
-                continue
+            scraper_game_id = scraper_game.id
+            logger.info(f"Matched prop's game {prop.game_id} to scraper game {scraper_game_id}")
+            # --- END NEW ---
 
-            prob_over, prob_under = calculate_probabilities(predicted_stat_value, betting_line, model_mse)
-            logger.info(f"Calculated probabilities for prop {prop_to_predict.id} - Over: {prob_over:.2f if prob_over is not None else 'N/A'}, Under: {prob_under:.2f if prob_under is not None else 'N/A'}")
+            logger.info(f"Processing prop for game {prop.game.away_team_ref.team_name} @ {prop.game.home_team_ref.team_name} ({scraper_game_id})")
 
-            if prob_over is not None and prob_under is not None:
-                prediction_data_dict = {
-                    "player_prop_id": prop_to_predict.id,
-                    "model_version_id": model_version.id,
-                    "predicted_over_probability": prob_over,
-                    "predicted_under_probability": prob_under,
-                    "predicted_value": float(predicted_stat_value) 
-                }
-                prediction_create_data = prediction_schema.PredictionCreate(**prediction_data_dict)
+            if game_date not in historical_stats_cache:
                 try:
-                    existing_prediction = db.query(db_models.Prediction).filter(
-                        db_models.Prediction.player_prop_id == prop_to_predict.id,
-                        db_models.Prediction.model_version_id == model_version.id
-                    ).first()
-                    if existing_prediction:
-                        existing_prediction.predicted_over_probability = prediction_create_data.predicted_over_probability
-                        existing_prediction.predicted_under_probability = prediction_create_data.predicted_under_probability
-                        existing_prediction.predicted_value = prediction_create_data.predicted_value 
-                        existing_prediction.prediction_datetime = datetime.datetime.now(datetime.timezone.utc)
-                        db.commit()
-                        db.refresh(existing_prediction)
-                        logger.info(f"Successfully updated prediction for prop ID {prop_to_predict.id}")
-                    else:
-                        new_prediction = crud_predictions.create_prediction(db=db, prediction=prediction_create_data)
-                        logger.info(f"Successfully created new prediction ID: {new_prediction.id} for prop ID {prop_to_predict.id}")
+                    logger.info(f"Fetching and caching historical stats for game date {game_date}...")
+                    all_historical_stats = await fetch_all_historical_stats(db, game_date)
+                    if all_historical_stats.empty:
+                        logger.warning(f"No historical stats found before {game_date}. Team/opponent features may be NaN.")
+                    historical_stats_cache[game_date] = all_historical_stats
                 except Exception as e:
-                    logger.error(f"DB error storing prediction for prop {prop_to_predict.id}: {e}", exc_info=True)
-                    db.rollback()
-            else:
-                logger.warning(f"Probabilities were None for prop {prop_to_predict.id}. Prediction not stored.")
-
-def main(args):
-    logger.info("Starting prediction generation process...")
-    db: Optional[Session] = None
-    try:
-        db = get_db_session()
-        
-        date_filter = None
-        if args.date:
+                    logger.error(f"Failed to load historical data for game date {game_date}: {e}")
+                    historical_stats_cache[game_date] = pd.DataFrame() # Cache empty df to avoid retries
+                    continue
+            
+            all_historical_stats = historical_stats_cache[game_date]
+            
+            prediction_to_create = None
             try:
-                date_filter = datetime.datetime.strptime(args.date, "%Y-%m-%d").date()
-                logger.info(f"Filtering for props on or after: {date_filter}")
-            except ValueError:
-                logger.error(f"Invalid date format: {args.date}. Please use YYYY-MM-DD.")
-                return
+                model_name_prefix = DEFAULT_PROP_MARKET_TO_STAT_MAP.get(prop.market.key)
+                if not model_name_prefix:
+                    logger.warning(f"No stat mapping for market key '{prop.market.key}'. Skipping prop.")
+                    continue
 
-        upcoming_props = get_upcoming_player_props(db, game_date_cutoff=date_filter)
-        
-        if not upcoming_props:
-            logger.info("No upcoming player props found to process.")
-            return
-            
-        make_predictions_for_props(db, upcoming_props)
-            
+                player_id = prop.player_id
+                player_name = prop.player.player_name
+                logger.info(f"--- Processing prop: {player_name} - {model_name_prefix} (Line: {prop.line}) ---")
+                
+                player_game_log_df = await fetch_player_game_log(db, player_id, game_date)
+                if player_game_log_df.empty:
+                    logger.warning(f"No game log found for {player_name} ({player_id}). Skipping prop.")
+                    continue
+
+                current_game_df = pd.DataFrame([{
+                    'game_id': scraper_game_id, # Use the CORRECT game ID
+                    'player_id': player_id,
+                    'team_id': prop.player.team_id,
+                    'opponent_team_id': home_team_id if prop.player.team_id == away_team_id else away_team_id,
+                    'game_datetime': prop.game.game_datetime,
+                    'is_home_game': 1 if prop.player.team_id == home_team_id else 0,
+                }])
+                
+                base_df = pd.concat([player_game_log_df, current_game_df], ignore_index=True)
+
+                logger.info(f"Generating features for {player_name} for stat '{model_name_prefix}'...")
+                final_features_df = generate_full_feature_set(
+                    base_df=base_df,
+                    target_stat=model_name_prefix,
+                    team_context_df=all_historical_stats,
+                    rolling_windows=ROLLING_WINDOWS
+                )
+                
+                if final_features_df.empty:
+                    logger.warning(f"Feature generation for {player_name} resulted in an empty DataFrame. Skipping.")
+                    continue
+
+                current_features = final_features_df.iloc[[-1]]
+                
+                # --- Make Predictions using Regression Model ---
+                (
+                    reg_pipeline, 
+                    reg_icp_scores, 
+                    reg_feature_names, 
+                    reg_model_version_id
+                ) = await load_model_artifacts(db, model_name_prefix, "regression")
+
+                predicted_value = None
+                lower_bound, upper_bound = None, None
+
+                if reg_pipeline and reg_feature_names:
+                    current_features_aligned_reg = current_features.reindex(columns=reg_feature_names, fill_value=0)
+                    
+                    try:
+                        predicted_value = reg_pipeline.predict(current_features_aligned_reg)[0]
+                        logger.info(f"Regression Prediction: {predicted_value:.2f}")
+                        
+                        if reg_icp_scores is not None:
+                            lower_bound, upper_bound = get_regression_interval(predicted_value, reg_icp_scores)
+                            logger.info(f"Conformal Interval: [{lower_bound:.2f}, {upper_bound:.2f}]")
+
+                    except Exception as e:
+                        logger.error(f"Error during regression prediction for {player_name}: {e}")
+                        logger.error(traceback.format_exc())
+
+                # --- Make Predictions using Classification Model ---
+                (
+                    clf_pipeline, 
+                    clf_icp_scores, 
+                    clf_feature_names, 
+                    clf_model_version_id
+                ) = await load_model_artifacts(db, model_name_prefix, "classification")
+                
+                p_value_over, p_value_under = None, None
+                over_under_prediction = None
+                probas = None
+                
+                if clf_pipeline and clf_feature_names:
+                    current_features_clf = current_features.copy()
+                    current_features_clf['prop_line'] = prop.line
+                    
+                    current_features_aligned_clf = current_features_clf.reindex(columns=clf_feature_names, fill_value=0)
+                    
+                    try:
+                        probas = clf_pipeline.predict_proba(current_features_aligned_clf)[0]
+                        over_under_prediction = "OVER" if probas[1] > 0.5 else "UNDER"
+                        logger.info(f"Classification Prediction: {over_under_prediction} (Probs: {probas})")
+                        
+                        if clf_icp_scores is not None:
+                            p_value_under, p_value_over = get_classification_p_values(probas, clf_icp_scores)
+                            logger.info(f"P-Values -> Over: {p_value_over:.3f}, Under: {p_value_under:.3f}")
+
+                    except Exception as e:
+                        logger.error(f"Error during classification prediction for {player_name}: {e}")
+                        logger.error(traceback.format_exc())
+                
+                if reg_model_version_id or clf_model_version_id:
+                    prediction_to_create = PredictionCreate(
+                        player_prop_id=prop.id,
+                        regression_model_version_id=reg_model_version_id,
+                        classification_model_version_id=clf_model_version_id,
+                        predicted_value=predicted_value,
+                        prediction_time=datetime.now(timezone.utc),
+                        confidence_interval_lower=lower_bound,
+                        confidence_interval_upper=upper_bound,
+                        p_value_over=p_value_over,
+                        p_value_under=p_value_under,
+                        over_under_prediction=over_under_prediction
+                    )
+                    all_predictions_to_create.append(prediction_to_create)
+
+                    csv_row = {
+                        "Player": player_name,
+                        "Game": f"{prop.game.away_team_ref.team_name} @ {prop.game.home_team_ref.team_name}",
+                        "Market": prop.market.key,
+                        "Line": prop.line,
+                        "Over Prob.": f"{probas[1]:.3f}" if probas is not None else "N/A",
+                        "Under Prob.": f"{probas[0]:.3f}" if probas is not None else "N/A",
+                        "ICP Interval": f"[{lower_bound:.2f}, {upper_bound:.2f}]" if lower_bound is not None and upper_bound is not None else "N/A",
+                        "Calibrated Over": f"{p_value_over:.3f}" if p_value_over is not None else "N/A",
+                        "Calibrated Under": f"{p_value_under:.3f}" if p_value_under is not None else "N/A",
+                        "ICP Set": "N/A"
+                    }
+                    predictions_for_csv.append(csv_row)
+
+            except Exception as e:
+                logger.error(f"Failed to process prop for {prop.player.player_name}: {e}")
+                logger.error(traceback.format_exc())
+
+        except Exception as e:
+            logger.error(f"An unexpected error occurred processing prop {prop.id}: {e}")
+            logger.error(traceback.format_exc())
+
+    if all_predictions_to_create:
+        logger.info(f"Saving {len(all_predictions_to_create)} new predictions to the database...")
+        await crud_predictions.create_predictions_bulk(db, all_predictions_to_create)
+        logger.info("Successfully saved predictions.")
+
+async def save_predictions_to_csv(predictions_data: List[Dict[str, Any]], file_path: str):
+    """Saves a list of prediction data to a CSV file."""
+    if not predictions_data:
+        logger.info("No prediction data to save to CSV.")
+        return
+
+    df = pd.DataFrame(predictions_data)
+    
+    columns = [
+        "Player", "Game", "Market", "Line", "Over Prob.", "Under Prob.", 
+        "ICP Interval", "Calibrated Over", "Calibrated Under", "ICP Set"
+    ]
+    df = df[columns]
+
+    try:
+        df.to_csv(file_path, index=False)
+        logger.info(f"Successfully saved predictions to {file_path}")
     except Exception as e:
-        logger.error(f"An error occurred in the main prediction pipeline: {e}", exc_info=True)
-    finally:
-        if db is not None:
-            logger.info("Closing database session.")
-            db.close()
-    logger.info("Prediction generation process finished.")
+        logger.error(f"Failed to save predictions to CSV: {e}")
+
+
+async def fetch_all_historical_stats(db: AsyncSession, until_date: datetime.date) -> pd.DataFrame:
+    """
+    Fetches all player stats for all games up to a certain date.
+    This is used to generate team-level rolling averages.
+    """
+    logger.info(f"Fetching all historical stats for all teams before {until_date}...")
+    
+    stmt = (
+        select(
+            db_models.PlayerStat
+        )
+        .join(db_models.Game, db_models.PlayerStat.game_id == db_models.Game.id)
+        .where(func.date(db_models.Game.game_datetime) < until_date)
+        .options(joinedload(db_models.PlayerStat.game))
+    )
+    result = await db.execute(stmt)
+    stats = result.scalars().all()
+
+    if not stats:
+        return pd.DataFrame()
+
+    data = [
+        {
+            'game_id': stat.game_id,
+            'player_id': stat.player_id,
+            'team_id': stat.team_id,
+            'home_team_id': stat.game.home_team_id,
+            'away_team_id': stat.game.away_team_id,
+            'game_datetime': stat.game.game_datetime,
+            'points': stat.points,
+            'rebounds': stat.rebounds,
+            'assists': stat.assists,
+            'steals': stat.steals,
+            'blocks': stat.blocks,
+            'turnovers': stat.turnovers,
+            'field_goals_made': stat.field_goals_made,
+            'field_goals_attempted': stat.field_goals_attempted,
+            'three_pointers_made': stat.three_pointers_made,
+            'three_pointers_attempted': stat.three_pointers_attempted,
+            'free_throws_made': stat.free_throws_made,
+            'free_throws_attempted': stat.free_throws_attempted,
+        } for stat in stats
+    ]
+    df = pd.DataFrame(data)
+
+    df['opponent_team_id'] = df.apply(
+        lambda row: row['away_team_id'] if str(row['team_id']) == str(row['home_team_id']) else row['home_team_id'],
+        axis=1
+    )
+
+    base_cols = ['points', 'rebounds', 'assists', 'steals', 'blocks']
+    for col in base_cols:
+        df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0)
+    df['pra'] = df['points'] + df['rebounds'] + df['assists']
+    df['pr'] = df['points'] + df['rebounds']
+    df['pa'] = df['points'] + df['assists']
+    df['ra'] = df['rebounds'] + df['assists']
+    df['blocks_plus_steals'] = df['blocks'] + df['steals']
+    
+    return df
+
+
+async def fetch_player_game_log(db: AsyncSession, player_id: uuid.UUID, until_date: datetime.date) -> pd.DataFrame:
+    """Fetches the game log for a specific player up to a certain date."""
+    logger.info(f"Fetching game log for player {player_id} before {until_date}...")
+    
+    stmt = (
+        select(db_models.PlayerStat)
+        .join(db_models.Game, db_models.PlayerStat.game_id == db_models.Game.id)
+        .where(db_models.PlayerStat.player_id == player_id)
+        .where(func.date(db_models.Game.game_datetime) < until_date)
+        .options(
+            joinedload(db_models.PlayerStat.game).joinedload(db_models.Game.home_team_ref),
+            joinedload(db_models.PlayerStat.game).joinedload(db_models.Game.away_team_ref)
+        )
+        .order_by(db_models.Game.game_datetime.desc())
+    )
+    result = await db.execute(stmt)
+    game_logs = result.scalars().all()
+
+    if not game_logs:
+        return pd.DataFrame()
+    
+    data = [
+        {
+            'game_datetime': log.game.game_datetime,
+            'team_id': log.team_id,
+            'opponent_team_id': log.game.away_team_id if log.team_id == log.game.home_team_id else log.game.home_team_id,
+            'is_home_game': int(log.team_id == log.game.home_team_id),
+            'minutes_played': log.minutes_played,
+            'points': log.points,
+            'rebounds': log.rebounds,
+            'assists': log.assists,
+            'steals': log.steals,
+            'blocks': log.blocks,
+            'turnovers': log.turnovers,
+            'field_goals_made': log.field_goals_made,
+            'field_goals_attempted': log.field_goals_attempted,
+            'three_pointers_made': log.three_pointers_made,
+            'three_pointers_attempted': log.three_pointers_attempted,
+            'free_throws_made': log.free_throws_made,
+            'free_throws_attempted': log.free_throws_attempted,
+            'offensive_rebounds': log.offensive_rebounds,
+            'defensive_rebounds': log.defensive_rebounds,
+            'fouls': log.fouls,
+            'player_efficiency_rating': log.player_efficiency_rating,
+            'usage_rate': log.usage_rate,
+            'true_shooting_percentage': log.true_shooting_percentage,
+            'effective_field_goal_percentage': log.effective_field_goal_percentage
+        } for log in game_logs
+    ]
+    df = pd.DataFrame(data)
+
+    base_cols = ['points', 'rebounds', 'assists', 'steals', 'blocks']
+    for col in base_cols:
+        df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0)
+    df['pra'] = df['points'] + df['rebounds'] + df['assists']
+    df['pr'] = df['points'] + df['rebounds']
+    df['pa'] = df['points'] + df['assists']
+    df['ra'] = df['rebounds'] + df['assists']
+    df['blocks_plus_steals'] = df['blocks'] + df['steals']
+    
+    return df
+
+
+async def clear_old_predictions(db: AsyncSession):
+    """Clears all existing entries from the 'predictions' table."""
+    logger.info("Clearing old predictions from the database...")
+    try:
+        stmt = delete(db_models.Prediction)
+        await db.execute(stmt)
+        await db.commit()
+        logger.info("Successfully cleared old predictions.")
+    except Exception as e:
+        logger.error(f"Error clearing old predictions: {e}")
+        await db.rollback()
+
+async def main():
+    parser = argparse.ArgumentParser(description="Generate predictions for upcoming WNBA games.")
+    parser.add_argument("--clear", action="store_true", help="Clear all existing predictions before generating new ones.")
+    parser.add_argument("--output-csv", type=str, default="predictions.csv", help="Path to save the predictions CSV file.")
+    args = parser.parse_args()
+
+    predictions_for_csv = []
+
+    async with get_session() as db:
+        if args.clear:
+            await clear_old_predictions(db)
+
+        await make_predictions_for_props(db, predictions_for_csv)
+        
+        if predictions_for_csv:
+            await save_predictions_to_csv(predictions_for_csv, args.output_csv)
+
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Generate predictions for WNBA player props.")
-    parser.add_argument("--date", type=str, default=None,
-                        help="Optional specific date (YYYY-MM-DD) to fetch props for (on or after this date). Defaults to today.")
-    
-    cli_args = parser.parse_args()
-    
-    # Need to import scipy for calculate_probabilities if using normal distribution
-    # This is now handled within calculate_probabilities
-    # try:
-    #     import scipy.stats
-    # except ImportError:
-    #     logger.error("Scipy is not installed. Please install it ('pip install scipy') to use normal distribution for probability calculation. Falling back to simpler method.")
-    #     # Modify calculate_probabilities to not rely on scipy or ensure it handles its absence
-    #     # For now, the fallback is built-in, but a global flag could be better.
-    #     pass 
-        
-    main(cli_args) 
+    asyncio.run(main())

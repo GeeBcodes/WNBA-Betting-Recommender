@@ -92,5 +92,11 @@ async def get_player_stats(
 
     return results
 
+async def get_player_stat_by_game_and_player(db: AsyncSession, game_id: uuid.UUID, player_id: uuid.UUID) -> Optional[db_models.PlayerStat]:
+    """Fetches a single PlayerStat record for a given game and player."""
+    stmt = select(db_models.PlayerStat).where(db_models.PlayerStat.game_id == game_id, db_models.PlayerStat.player_id == player_id)
+    result = await db.execute(stmt)
+    return result.scalars().first()
+
 # Create, Update, Delete functions for PlayerStat can be added here if needed for API endpoints
 # For now, data is ingested by wnba_stats_scraper.py 

@@ -1,462 +1,353 @@
 import os
 import logging
 import requests
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from dotenv import load_dotenv
 from sqlalchemy.orm import Session
 from sqlalchemy.exc import IntegrityError
-import time # For rate limiting
-import sqlalchemy as sa # For functions like sa.func.date and sa.func.lower
+import time
+import sqlalchemy as sa
+import argparse
+from typing import Optional, List, Dict, Set
+from sqlalchemy import func
+from sqlalchemy.orm import Session 
+import unicodedata
+# import json # No longer needed, but keeping here in case of file state issues
+import traceback
 
-# Adjust sys.path to include the project root if this script is run directly
+# --- Setup Project Path ---
 import sys
 project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
 if project_root not in sys.path:
     sys.path.insert(0, project_root)
 
-from backend.db.session import SessionLocal # For direct script execution
-# from backend.app.dependencies import get_db # Not used directly in this script execution flow
-from backend.db import models # Access models like models.Sport
-from backend.schemas import odds as odds_schemas # Use alias to avoid name clashes
-# Specific model imports for clarity in function type hints and queries
-from backend.db.models import Sport, Bookmaker, Market, Game, Player, GameOdd, PlayerProp 
+# Now that the path is set up, we can import our modules
+from backend.app.crud import teams as crud_teams
+from backend.db.session import get_sync_db_session
+from backend.db.models import Game, Player, PlayerProp, Team, Bookmaker, Market, Sport
+from backend.schemas import game as game_schema
 
-# Configure logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+# --- Logging Configuration ---
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
 
-# Load .env file from the project root
+# --- Environment and API Configuration ---
 dotenv_path = os.path.join(project_root, '.env')
-if not os.path.exists(dotenv_path):
-    logging.warning(f".env file not found at {dotenv_path}. ODDS_API_KEY must be set via environment variables.")
 load_dotenv(dotenv_path=dotenv_path)
 
-ODDS_API_KEY = os.getenv("ODDS_API_KEY")
-if not ODDS_API_KEY:
-    logging.error("ODDS_API_KEY not found. Please set it in .env file or as an environment variable.")
-    # Depending on desired behavior, you might exit or raise an error here.
-
-# --- The Odds API Configuration ---
+THE_ODDS_API_KEY = os.getenv("THE_ODDS_API_KEY")
 API_BASE_URL = "https://api.the-odds-api.com/v4/sports"
 WNBA_SPORT_KEY = "basketball_wnba"
-REGIONS = ["us"] 
+REGIONS = "us,us_dfs"
+API_DELAY = 3
 
-BOOKMAKERS_OF_INTEREST = {
-    "bovada": "Bovada",
-    "mybookieag": "MyBookie.ag",
-    "prizepicks": "PrizePicks",
-    "underdog": "Underdog Fantasy"
-}
-
-GAME_MARKETS = {
-    "h2h": "Head to Head (Moneyline)",
-    "spreads": "Point Spread (Handicap)",
-    "totals": "Total Points (Over/Under)"
-}
-
+# --- Data Definitions ---
+BOOKMAKERS = {"prizepicks", "underdog", "bovada", "mybookieag"}
 PLAYER_PROPS_MARKETS = {
-    "player_points": "Player Points (Over/Under)",
-    "player_points_q1": "Player 1st Quarter Points (Over/Under)",
-    "player_rebounds": "Player Rebounds (Over/Under)",
-    "player_rebounds_q1": "Player 1st Quarter Rebounds (Over/Under)",
-    "player_assists": "Player Assists (Over/Under)",
-    "player_assists_q1": "Player 1st Quarter Assists (Over/Under)",
-    "player_threes": "Player Threes (Over/Under)",
-    "player_blocks": "Player Blocks (Over/Under)",
-    "player_steals": "Player Steals (Over/Under)",
-    "player_blocks_steals": "Player Blocks + Steals (Over/Under)",
-    "player_turnovers": "Player Turnovers (Over/Under)",
-    "player_points_rebounds_assists": "Player Points + Rebounds + Assists (Over/Under)",
-    "player_points_rebounds": "Player Points + Rebounds (Over/Under)",
-    "player_points_assists": "Player Points + Assists (Over/Under)",
-    "player_rebounds_assists": "Player Rebounds + Assists (Over/Under)",
-    # The following might need specific checking if keys are exact on The Odds API
-    "player_field_goals": "Player Field Goals (Over/Under)", 
-    "player_alternate_points": "Alternate Player Points", # API uses player_points_alternate
-    "player_alternate_rebounds": "Alternate Player Rebounds", # API uses player_rebounds_alternate
-    "player_alternate_assists": "Alternate Player Assists", # API uses player_assists_alternate
-    "player_alternate_threes": "Alternate Player Threes", # API uses player_threes_alternate
+    "player_points", "player_rebounds", "player_assists", "player_threes",
+    "player_blocks", "player_steals", "player_blocks_steals", "player_turnovers",
+    "player_points_rebounds_assists", "player_points_rebounds",
+    "player_points_assists", "player_rebounds_assists",
 }
-# Corrected Alternate Market Keys based on typical API patterns
-# User provided list was extensive, ensure these keys match API reality.
-# Focusing on a subset that is more commonly standardized or explicitly listed by The Odds API.
-# The user list included items like 'player_frees_made', 'player_first_basket' etc.
-# These often have very specific market keys or might not be universally available.
-# Refer to The Odds API for exact player prop market keys beyond common ones.
 
-# For now, let's use the keys as provided by user, assuming they are correct:
-PLAYER_PROPS_MARKETS_FROM_USER = {
-    "player_points": "Points (Over/Under)",
-    "player_points_q1": "1st Quarter Points (Over/Under)",
-    "player_rebounds": "Rebounds (Over/Under)",
-    "player_rebounds_q1": "1st Quarter Rebounds (Over/Under)",
-    "player_assists": "Assists (Over/Under)",
-    "player_assists_q1": "1st Quarter Assists (Over/Under)",
-    "player_threes": "Threes (Over/Under)",
-    "player_blocks": "Blocks (Over/Under)",
-    "player_steals": "Steals (Over/Under)",
-    "player_blocks_steals": "Blocks + Steals (Over/Under)",
-    "player_turnovers": "Turnovers (Over/Under)",
-    "player_points_rebounds_assists": "Points + Rebounds + Assists (Over/Under)",
-    "player_points_rebounds": "Points + Rebounds (Over/Under)",
-    "player_points_assists": "Points + Assists (Over/Under)",
-    "player_rebounds_assists": "Rebounds + Assists (Over/Under)",
-    "player_field_goals": "Field Goals (Over/Under)",
-    "player_frees_made": "Frees made (Over/Under)",
-    "player_frees_attempts": "Frees attempted (Over/Under)",
-    "player_first_basket": "First Basket Scorer (Yes/No)",
-    "player_first_team_basket": "First Basket Scorer on Team (Yes/No)",
-    "player_double_double": "Double Double (Yes/No)",
-    "player_triple_double": "Triple Double (Yes/No)",
-    "player_method_of_first_basket": "Method of First Basket (Various)",
-    "player_points_alternate": "Alternate Points (Over/Under)",
-    "player_rebounds_alternate": "Alternate Rebounds (Over/Under)",
-    "player_assists_alternate": "Alternate Assists (Over/Under)",
-    "player_blocks_alternate": "Alternate Blocks (Over/Under)",
-    "player_steals_alternate": "Alternate Steals (Over/Under)",
-    "player_turnovers_alternate": "Alternate Turnovers (Over/Under)",
-    "player_threes_alternate": "Alternate Threes (Over/Under)",
-    "player_points_assists_alternate": "Alternate Points + Assists (Over/Under)",
-    "player_points_rebounds_alternate": "Alternate Points + Rebounds (Over/Under)",
-    "player_rebounds_assists_alternate": "Alternate Rebounds + Assists (Over/Under)",
-    "player_points_rebounds_assists_alternate": "Alternate Points + Rebounds + Assists (Over/Under)"
+# --- Normalization Helpers ---
+TEAM_NAME_MAP = {
+    "Atlanta Dream": "Dream", "Chicago Sky": "Sky", "Connecticut Sun": "Sun",
+    "Dallas Wings": "Wings", "Indiana Fever": "Fever", "Las Vegas Aces": "Aces",
+    "Los Angeles Sparks": "Sparks", "Minnesota Lynx": "Lynx", "New York Liberty": "Liberty",
+    "Phoenix Mercury": "Mercury", "Seattle Storm": "Storm", "Washington Mystics": "Mystics",
+    "Golden State Valkyries": "Valkyries"
 }
-ALL_MARKETS = {**GAME_MARKETS, **PLAYER_PROPS_MARKETS_FROM_USER}
 
-# --- Database Helper Functions ---
-def _get_or_create_sport(db: Session, sport_key: str, sport_details: dict) -> Sport:
-    """Gets or creates a sport record in the database."""
-    sport = db.query(Sport).filter(Sport.key == sport_key).first()
-    if not sport:
-        sport_data = odds_schemas.SportCreate(
-            key=sport_key,
-            group_name=sport_details.get("group"),
-            title=sport_details.get("title"),
-            description=sport_details.get("description"),
-            active=sport_details.get("active", True),
-            has_outrights=sport_details.get("has_outrights", False)
-        )
-        sport = Sport(**sport_data.model_dump())
-        db.add(sport)
-        try:
-            db.commit()
-            db.refresh(sport)
-            logging.info(f"Created sport: {sport.title} (Key: {sport.key})")
-        except IntegrityError:
-            db.rollback()
-            sport = db.query(Sport).filter(Sport.key == sport_key).first()
-            logging.info(f"Sport '{sport_key}' already exists, retrieved.")
-        except Exception as e:
-            db.rollback()
-            logging.error(f"Error creating/retrieving sport {sport_key}: {e}", exc_info=True)
-            raise # Re-raise after logging to halt if critical
-    return sport
+def normalize_player_name(name: str) -> str:
+    """Aggressively normalizes a player's name for robust matching."""
+    if not name: return ""
+    # Normalize unicode characters (e.g., 'Azurá' -> 'Azura')
+    name = unicodedata.normalize('NFKD', name).encode('ascii', 'ignore').decode('utf-8')
+    # Convert to lowercase, remove periods, and strip whitespace
+    name = name.lower().replace('.', '').strip()
+    # Manual override for specific known discrepancies
+    if name == "skylar diggins-smith":
+        name = "skylar diggins"
+    return name
 
-def _get_or_create_bookmaker(db: Session, bookmaker_key: str, bookmaker_title: str) -> Bookmaker:
-    """Gets or creates a bookmaker record in the database."""
-    bookmaker = db.query(Bookmaker).filter(Bookmaker.key == bookmaker_key).first()
-    if not bookmaker:
-        bookmaker_data = odds_schemas.BookmakerCreate(key=bookmaker_key, title=bookmaker_title)
-        bookmaker = Bookmaker(**bookmaker_data.model_dump())
-        db.add(bookmaker)
-        try:
-            db.commit()
-            db.refresh(bookmaker)
-            logging.info(f"Created bookmaker: {bookmaker.title} (Key: {bookmaker.key})")
-        except IntegrityError:
-            db.rollback()
-            bookmaker = db.query(Bookmaker).filter(Bookmaker.key == bookmaker_key).first()
-            logging.info(f"Bookmaker '{bookmaker_key}' already exists, retrieved.")
-        except Exception as e:
-            db.rollback()
-            logging.error(f"Error creating/retrieving bookmaker {bookmaker_key}: {e}", exc_info=True)
-            raise
-    return bookmaker
+# --- API Request Helper ---
+def make_api_request(url: str, params: dict) -> Optional[dict]:
+    try:
+        response = requests.get(url, params=params, timeout=30)
+        remaining = response.headers.get('X-Requests-Remaining')
+        if remaining:
+            logger.info(f"API Quota Remaining: {remaining}")
+        response.raise_for_status()
+        return response.json()
+    except requests.exceptions.RequestException as e:
+        logger.error(f"API request failed: {e}")
+        return None
 
-def _get_or_create_market(db: Session, market_key: str, market_description: str) -> Market:
-    """Gets or creates a market record in the database."""
-    market = db.query(Market).filter(Market.key == market_key).first()
-    if not market:
-        market_data = odds_schemas.MarketCreate(key=market_key, description=market_description)
-        market = Market(**market_data.model_dump())
-        db.add(market)
-        try:
-            db.commit()
-            db.refresh(market)
-            logging.info(f"Created market: {market.description} (Key: {market.key})")
-        except IntegrityError:
-            db.rollback()
-            market = db.query(Market).filter(Market.key == market_key).first()
-            logging.info(f"Market '{market_key}' already exists, retrieved.")
-        except Exception as e:
-            db.rollback()
-            logging.error(f"Error creating/retrieving market {market_key}: {e}", exc_info=True)
-            raise
-    return market
-
-def _get_game_by_details(db: Session, home_team_name: str, away_team_name: str, game_api_id: str, game_datetime_utc: datetime) -> Game | None:
-    """
-    Tries to find a game by API ID first, then by home team, away team, and game date.
-    The Odds API game_datetime is already in UTC (ISO 8601 format).
-    Assumes team names from Odds API match those in our DB (e.g., from WNBA stats scraper).
-    """
-    if game_api_id:
-        game = db.query(Game).filter(Game.external_id == game_api_id).first()
+# --- Database Operations ---
+def get_game(db: Session, event: dict) -> Optional[Game]:
+    """Finds a game in the DB matching the API event data, creating it if necessary."""
+    # Strategy 1: Find the game by its unique API ID. This is the most reliable method.
+    api_game_id = event.get('id')
+    if api_game_id:
+        game = db.query(Game).filter(Game.the_odds_api_game_id == api_game_id).first()
         if game:
-            logging.debug(f"Found game by external_id: {game_api_id} (DB ID: {game.id})")
+            logger.info(f"Successfully matched event to Game ID {game.id} using API game ID.")
             return game
 
-    game_date = game_datetime_utc.date()
-    
-    # Try direct match first
-    game = db.query(Game).filter(
-        Game.home_team == home_team_name,
-        Game.away_team == away_team_name,
-        sa.func.date(Game.game_datetime) == game_date
-    ).order_by(Game.game_datetime.desc()).first() # Prefer latest if multiple on same date somehow
-    if game:
-        logging.debug(f"Found game by teams & date: {home_team_name} vs {away_team_name} on {game_date} (DB ID: {game.id})")
-        return game
-    
-    # Try swapped teams (sometimes APIs list home/away differently)
-    game = db.query(Game).filter(
-        Game.home_team == away_team_name, 
-        Game.away_team == home_team_name, 
-        sa.func.date(Game.game_datetime) == game_date
-    ).order_by(Game.game_datetime.desc()).first()
-    if game:
-        logging.debug(f"Found game by SWAPPED teams & date: {away_team_name} vs {home_team_name} on {game_date} (DB ID: {game.id})")
-        return game
+    # --- Fallback to matching by teams and date if API ID lookup fails ---
+    try:
+        game_dt_utc = datetime.fromisoformat(event.get("commence_time").replace("Z", "+00:00"))
+    except (ValueError, TypeError):
+        logger.error(f"Invalid or missing commence_time in event: {event.get('id')}")
+        return None
 
-    logging.warning(f"Game not found for API ID: '{game_api_id}', Teams: '{home_team_name}' vs '{away_team_name}', Date: {game_date}")
+    logger.info(f"--- Attempting to match event: {event.get('home_team')} vs {event.get('away_team')} at {game_dt_utc} by teams and date ---")
+
+    home_team_name_from_api = event.get('home_team', '')
+    away_team_name_from_api = event.get('away_team', '')
+
+    home_team_db_name = TEAM_NAME_MAP.get(home_team_name_from_api)
+    away_team_db_name = TEAM_NAME_MAP.get(away_team_name_from_api)
+
+    if not home_team_db_name or not away_team_db_name:
+        logger.warning(f"Could not normalize one or both team names from API: '{home_team_name_from_api}', '{away_team_name_from_api}'.")
+        return None
+
+    home_team = crud_teams.get_team_by_name(db, name=home_team_db_name)
+    away_team = crud_teams.get_team_by_name(db, name=away_team_db_name)
+
+    if not home_team or not away_team:
+        logger.warning(f"Could not find one or both teams in the database by mapped name: {home_team_db_name}, {away_team_db_name}")
+        return None
+
+    api_date = game_dt_utc.date()
+    logger.info(f"Searching for game between {home_team_db_name} and {away_team_db_name} on the UTC date: {api_date}")
+
+    games_on_date = db.query(Game).filter(
+        func.date(Game.game_datetime) == api_date,
+        ((Game.home_team_id == home_team.id) & (Game.away_team_id == away_team.id)) |
+        ((Game.home_team_id == away_team.id) & (Game.away_team_id == home_team.id))
+    ).all()
+
+    if len(games_on_date) == 1:
+        game = games_on_date[0]
+        logger.info(f"Successfully matched event to Game ID: {game.id}")
+        return game
+    elif len(games_on_date) > 1:
+        logger.warning(f"Found multiple games ({len(games_on_date)}) on the same date. Selecting the one closest in time.")
+        closest_game = min(games_on_date, key=lambda g: abs(g.game_datetime.replace(tzinfo=timezone.utc) - game_dt_utc))
+        logger.info(f"Selected closest game. Matched event to Game ID: {closest_game.id}")
+        return closest_game
+    else:
+        logger.warning(f"Could not find a matching game for event {api_game_id}. Creating a new one.")
+        
+        # Create the game. If this fails (e.g., because the lookup failed and the game
+        # already exists), the exception will now correctly propagate up to the main
+        # try/except block, which will perform a rollback on the entire session.
+        new_game_schema = game_schema.GameCreate(
+            the_odds_api_game_id=event['id'],
+            game_datetime=game_dt_utc,
+            season=game_dt_utc.year,
+            status='Scheduled',
+            home_team_id=home_team.id,
+            away_team_id=away_team.id
+        )
+        
+        new_game_data = {k: v for k, v in new_game_schema.model_dump().items() if v is not None}
+        db_game = Game(**new_game_data)
+        db.add(db_game)
+        db.flush()  # Send the insert to the DB to check for errors immediately.
+        db.refresh(db_game)
+        logger.info(f"Successfully added new game with ID: {db_game.id} to session.")
+        return db_game
+
+def get_player(db: Session, player_name: str, team_ids: list[int]) -> Optional[Player]:
+    """Finds a player in the DB matching the name, constrained by team. Tries multiple strategies."""
+    normalized_name = normalize_player_name(player_name)
+    
+    # Strategy 1: Exact full name match (case-insensitive), as this is the most reliable.
+    player = db.query(Player).filter(
+        func.lower(Player.player_name) == normalized_name,
+        Player.team_id.in_(team_ids)
+    ).first()
+    if player:
+        return player
+
+    # Fallback Strategy 2: Contains match (case-insensitive) to handle partial names or slight differences.
+    player = db.query(Player).filter(
+        func.lower(Player.player_name).contains(normalized_name),
+        Player.team_id.in_(team_ids)
+    ).first()
+    if player:
+        return player
+
     return None
 
-
-def _get_player_by_name(db: Session, player_name: str) -> Player | None:
-    """
-    Finds a player by name. Case-insensitive search.
-    This might require more sophisticated matching (e.g., fuzzy matching, aliases) in production.
-    """
-    normalized_name = player_name.strip() # Basic normalization
-    player = db.query(Player).filter(sa.func.lower(Player.player_name) == sa.func.lower(normalized_name)).first()
-    
-    if not player:
-        logging.warning(f"Player '{normalized_name}' (original from API: '{player_name}') not found in DB.")
-        # Potential enhancement: Try fuzzy matching or search by first/last name components if direct match fails.
-    return player
-
-
-# --- Main API Fetching and Storing Logic ---
-def fetch_and_store_wnba_odds(db: Session, sport_key: str, regions_str: str, bookmakers_str: str, markets_str: str):
-    """
-    Fetches odds for the WNBA from The Odds API for specified markets and bookmakers,
-    then stores them in the database.
-    Simplified player prop handling for this version.
-    """
-    if not ODDS_API_KEY:
-        logging.error("Cannot fetch odds: ODDS_API_KEY is not set.")
+def process_odds_data(db: Session, event_odds: dict):
+    """Processes and stores player prop odds for a single event."""
+    game = get_game(db, event_odds)
+    if not game:
+        logger.warning(f"Skipping odds for event ID {event_odds['id']} as no matching game was found.")
         return
 
-    wnba_sport_details = {"group": "Basketball", "title": "WNBA", "description": "Women's National Basketball Association"}
-    _get_or_create_sport(db, sport_key, wnba_sport_details)
+    # Pre-fetch bookmaker and market IDs for efficiency
+    bookmaker_key_to_id = {b.key: b.id for b in db.query(Bookmaker).filter(Bookmaker.key.in_(BOOKMAKERS)).all()}
+    market_key_to_id = {m.key: m.id for m in db.query(Market).filter(Market.key.in_(PLAYER_PROPS_MARKETS)).all()}
+    
+    home_team_id = game.home_team_id
+    away_team_id = game.away_team_id
+    
+    all_props_to_upsert = []
 
-    endpoint_url = f"{API_BASE_URL}/{sport_key}/odds"
-    params = {
-        "apiKey": ODDS_API_KEY,
-        "regions": regions_str,
-        "markets": markets_str,
-        "bookmakers": bookmakers_str,
-        "oddsFormat": "decimal",
-        "dateFormat": "iso"
-    }
+    for bookmaker_data in event_odds.get("bookmakers", []):
+        bookmaker_key = bookmaker_data.get("key")
+        bookmaker_id = bookmaker_key_to_id.get(bookmaker_key)
+        if not bookmaker_id:
+            continue # Skip bookmakers we don't care about
 
-    logging.info(f"Fetching odds from: {endpoint_url} with params: markets='{markets_str}', bookmakers='{bookmakers_str}'")
+        for market_data in bookmaker_data.get("markets", []):
+            market_key = market_data.get("key")
+            market_id = market_key_to_id.get(market_key)
+            if not market_id:
+                continue # Skip markets we don't care about
 
-    try:
-        response = requests.get(endpoint_url, params=params, timeout=45) # Increased timeout slightly
-        response.raise_for_status()
-        
-        remaining_requests = response.headers.get('X-Requests-Remaining')
-        if remaining_requests:
-            logging.info(f"API Requests Remaining: {remaining_requests}")
+            # This dictionary will hold {('Player Name', 10.5): {'over': 1.80, 'under': 1.90}}
+            player_lines = {}
+            for outcome in market_data.get("outcomes", []):
+                player_name_api = outcome.get("description")
+                line = outcome.get("point")
 
-        events_data = response.json()
-        if not events_data:
-            logging.info(f"No game events returned from API for markets: {markets_str}.")
-            return
-
-        logging.info(f"Received {len(events_data)} game events for markets: {markets_str}.")
-        
-        items_to_commit = []
-
-        for event in events_data:
-            api_game_id = event.get("id")
-            home_team_api = event.get("home_team")
-            away_team_api = event.get("away_team")
-            commence_time_str = event.get("commence_time")
-
-            if not all([api_game_id, home_team_api, away_team_api, commence_time_str]):
-                logging.warning(f"Event missing critical data (id, teams, or time), skipping: {event.get('id', 'Unknown ID')}")
-                continue
-            
-            try:
-                game_datetime_utc = datetime.fromisoformat(commence_time_str.replace("Z", "+00:00"))
-            except ValueError as e:
-                logging.error(f"Invalid date format for event {api_game_id}: {commence_time_str}. Error: {e}")
-                continue
-
-            db_game = _get_game_by_details(db, home_team_api, away_team_api, api_game_id, game_datetime_utc)
-            if not db_game:
-                logging.warning(f"DB Game not found for API event: {api_game_id}, {home_team_api} vs {away_team_api}. Skipping odds.")
-                continue
-
-            for bookie_data in event.get("bookmakers", []):
-                bookmaker_key_api = bookie_data.get("key")
-                if bookmaker_key_api not in BOOKMAKERS_OF_INTEREST:
+                if not player_name_api or line is None:
                     continue
-                db_bookmaker = _get_or_create_bookmaker(db, bookmaker_key_api, BOOKMAKERS_OF_INTEREST.get(bookmaker_key_api, bookie_data.get("title")))
 
-                for market_data_api in bookie_data.get("markets", []):
-                    market_key_api = market_data_api.get("key")
-                    if market_key_api not in ALL_MARKETS:
-                        continue
-                    db_market = _get_or_create_market(db, market_key_api, ALL_MARKETS[market_key_api])
+                prop_key = (player_name_api, line)
+                if prop_key not in player_lines:
+                    player_lines[prop_key] = {}
+                
+                outcome_name = outcome.get("name", "").lower()
+                if outcome_name == "over":
+                    player_lines[prop_key]["over_price"] = outcome.get("price")
+                elif outcome_name == "under":
+                    player_lines[prop_key]["under_price"] = outcome.get("price")
+
+            # Now that we've grouped over/under pairs, process them
+            for (player_name_api, line), prices in player_lines.items():
+                # Crucially, search for the player ONLY on the two teams in this game
+                player = get_player(db, player_name_api, [home_team_id, away_team_id])
+                
+                if not player:
+                    # This will correctly log players who are in the API but not on the competing teams, or can't be matched
+                    logger.warning(f"Could not match player '{player_name_api}' to a player on the competing teams for game {game.id}. Skipping prop.")
+                    continue
                     
-                    market_last_update_utc = None
-                    if market_data_api.get("last_update"):
-                        try:
-                            market_last_update_utc = datetime.fromisoformat(market_data_api.get("last_update").replace("Z", "+00:00"))
-                        except ValueError:
-                            market_last_update_utc = datetime.now(timezone.utc) # Fallback
+                # Found a valid player, prepare the prop data for upsert
+                
+                # Construct the 'outcomes' JSON field
+                # In the future, this could be expanded to include alternate lines if the API provides them
+                outcomes_json = [
+                    {
+                        "name": player_name_api,
+                        "price": prices.get("over_price"),
+                        "point": line,
+                        "line_id": "standard_over" # Or some identifier
+                    },
+                    {
+                        "name": player_name_api,
+                        "price": prices.get("under_price"),
+                        "point": line,
+                        "line_id": "standard_under"
+                    }
+                ]
 
-                    api_outcomes = market_data_api.get("outcomes")
-                    if not api_outcomes:
-                        continue
+                prop_data = {
+                    "game_id": game.id,
+                    "player_id": player.id,
+                    "market_id": market_id,
+                    "bookmaker_id": bookmaker_id,
+                    "line": line,
+                    "over_price": prices.get("over_price"),
+                    "under_price": prices.get("under_price"),
+                    "last_update_api": datetime.fromisoformat(market_data["last_update"].replace("Z", "+00:00")),
+                    "outcomes": outcomes_json
+                }
+                all_props_to_upsert.append(prop_data)
 
-                    if market_key_api in GAME_MARKETS:
-                        existing_odd = db.query(GameOdd).filter_by(game_id=db_game.id, bookmaker_id=db_bookmaker.id, market_id=db_market.id).first()
-                        if existing_odd:
-                            if existing_odd.last_update_api and market_last_update_utc and market_last_update_utc <= existing_odd.last_update_api:
-                                continue # Skip if not newer
-                            existing_odd.last_update_api = market_last_update_utc
-                            existing_odd.outcomes = api_outcomes
-                            if existing_odd not in items_to_commit: items_to_commit.append(existing_odd)
+    if all_props_to_upsert:
+        logger.info(f"Identified {len(all_props_to_upsert)} valid player props to upsert for game {game.id}")
+        for prop_data in all_props_to_upsert:
+                        existing_prop = db.query(PlayerProp).filter_by(
+                game_id=prop_data['game_id'],
+                player_id=prop_data['player_id'],
+                market_id=prop_data['market_id'],
+                bookmaker_id=prop_data['bookmaker_id'],
+                line=prop_data['line']
+                        ).first()
+
+                        if existing_prop:
+                             # Update existing prop
+                            for key, value in prop_data.items():
+                                setattr(existing_prop, key, value)
                         else:
-                            new_odd = GameOdd(
-                                game_id=db_game.id, bookmaker_id=db_bookmaker.id, market_id=db_market.id,
-                                last_update_api=market_last_update_utc, outcomes=api_outcomes
-                            )
-                            if new_odd not in items_to_commit: items_to_commit.append(new_odd)
+                             # Insert new prop
+                            new_prop = PlayerProp(**prop_data)
+                            db.add(new_prop)
+    else:
+        logger.info(f"No valid, matchable player props found for game {game.id} from the API response.")
+    
 
-                    elif market_key_api in PLAYER_PROPS_MARKETS_FROM_USER:
-                        for outcome_line in api_outcomes: # Each outcome_line is a specific bet, e.g., Player A Points Over 10.5
-                            player_name_api = outcome_line.get("description")
-                            if not player_name_api:
-                                logging.warning(f"Player prop outcome missing player name for market {market_key_api}. Data: {outcome_line}")
-                                continue
-                            db_player = _get_player_by_name(db, player_name_api)
-                            if not db_player:
-                                logging.warning(f"Player '{player_name_api}' for prop market '{market_key_api}' not found. Skipping line.")
-                                continue
-                            
-                            # Simplified: One PlayerProp DB entry per unique line (player, market, bookie, specific outcome like name+point).
-                            # This requires a more granular unique constraint on PlayerProp or careful update logic.
-                            # The current PlayerProp unique constraint in model is: game_id, player_name_api, bookmaker_id, market_id.
-                            # This means one PlayerProp record stores ALL lines for that player for that market_id.
 
-                            existing_prop_for_player_market = db.query(PlayerProp).filter_by(
-                                game_id=db_game.id, player_id=db_player.id,
-                                bookmaker_id=db_bookmaker.id, market_id=db_market.id
-                            ).first()
+# --- Main Orchestration ---
+def fetch_and_store_player_props(db: Session):
+    """
+    Fetches upcoming events and their player prop odds from the API,
+    then processes and stores them in the database.
+    """
+    if not THE_ODDS_API_KEY:
+        logger.error("THE_ODDS_API_KEY environment variable not set. Exiting.")
+        return
 
-                            if existing_prop_for_player_market:
-                                if existing_prop_for_player_market.last_update_api and market_last_update_utc and market_last_update_utc <= existing_prop_for_player_market.last_update_api:
-                                    # Check if this specific line needs update within the existing outcomes array
-                                    line_updated = False
-                                    if isinstance(existing_prop_for_player_market.outcomes, list):
-                                        for i, ex_line in enumerate(existing_prop_for_player_market.outcomes):
-                                            if ex_line.get('name') == outcome_line.get('name') and ex_line.get('point') == outcome_line.get('point'):
-                                                existing_prop_for_player_market.outcomes[i] = outcome_line
-                                                line_updated = True
-                                                break
-                                        if not line_updated:
-                                            existing_prop_for_player_market.outcomes.append(outcome_line)
-                                    else: # Overwrite if not a list or initialize
-                                        existing_prop_for_player_market.outcomes = [outcome_line]
-                                else: # Market data is newer, rebuild outcomes for this player prop
-                                     existing_prop_for_player_market.outcomes = [outcome_line] # Start with this line, assuming subsequent lines for same player/market are appended in this pass
-                                
-                                existing_prop_for_player_market.last_update_api = market_last_update_utc
-                                if existing_prop_for_player_market not in items_to_commit: items_to_commit.append(existing_prop_for_player_market)
-                            
-                            else: # Create new PlayerProp for this player for this market_id
-                                new_prop = PlayerProp(
-                                    game_id=db_game.id, player_id=db_player.id,
-                                    bookmaker_id=db_bookmaker.id, market_id=db_market.id,
-                                    player_name_api=player_name_api,
-                                    last_update_api=market_last_update_utc,
-                                    outcomes=[outcome_line] # Store the single line as a list with one item
-                                )
-                                if new_prop not in items_to_commit: items_to_commit.append(new_prop)
-        if items_to_commit:
-            try:
-                db.add_all(items_to_commit)
-                db.commit()
-                logging.info(f"Committed {len(items_to_commit)} new/updated odds entries for markets: {markets_str}.")
-            except Exception as e:
-                db.rollback()
-                logging.error(f"DB commit error for markets {markets_str}: {e}", exc_info=True)
+    events_url = f"{API_BASE_URL}/{WNBA_SPORT_KEY}/events"
+    events_params = {"apiKey": THE_ODDS_API_KEY}
+    events = make_api_request(events_url, events_params)
 
-    except requests.exceptions.HTTPError as http_err:
-        logging.error(f"HTTP error for markets {markets_str}: {http_err} - Response: {http_err.response.text if http_err.response else 'No response'}")
-    except requests.exceptions.RequestException as req_err:
-        logging.error(f"Request error for markets {markets_str}: {req_err}")
-    except Exception as e:
-        db.rollback()
-        logging.error(f"Unexpected error for markets {markets_str}: {e}", exc_info=True)
+    if not events:
+        logger.error("Failed to fetch WNBA events. Exiting.")
+        return
 
+    logger.info(f"Found {len(events)} upcoming events.")
+
+    for i, event in enumerate(events):
+        logger.info(f"Fetching odds for event: {event['home_team']} vs {event['away_team']}")
+        odds_url = f"{API_BASE_URL}/{WNBA_SPORT_KEY}/events/{event['id']}/odds"
+        markets_to_fetch = ",".join(PLAYER_PROPS_MARKETS)
+        odds_params = {
+            "apiKey": THE_ODDS_API_KEY, "regions": REGIONS,
+            "markets": markets_to_fetch
+        }
+        event_odds = make_api_request(odds_url, odds_params)
+        
+        if event_odds:
+            process_odds_data(db, event_odds)
+    else:
+            logger.warning(f"Could not retrieve odds for event ID {event['id']}")
+        
+    if i < len(events) - 1:
+            time.sleep(API_DELAY)
 
 def main():
-    logging.info("Starting The Odds API ingestion pipeline...")
-    db: Session = SessionLocal()
-    try:
-        regions_param = ",".join(REGIONS)
-        bookies_param = ",".join(BOOKMAKERS_OF_INTEREST.keys())
-
-        logging.info("--- Fetching Game Markets ---")
-        game_markets_param = ",".join(GAME_MARKETS.keys())
-        if game_markets_param:
-            fetch_and_store_wnba_odds(db, WNBA_SPORT_KEY, regions_param, bookies_param, game_markets_param)
-            time.sleep(2) # Pause between major API calls
-        else:
-            logging.info("No game markets configured to fetch.")
-
-        logging.info("--- Fetching Player Prop Markets (one by one) ---")
-        if not PLAYER_PROPS_MARKETS_FROM_USER:
-            logging.info("No player prop markets configured to fetch.")
-        else:
-            for market_key in PLAYER_PROPS_MARKETS_FROM_USER.keys():
-                logging.info(f"Fetching player prop market: {market_key}")
-                fetch_and_store_wnba_odds(db, WNBA_SPORT_KEY, regions_param, bookies_param, market_key)
-                time.sleep(5) # Be respectful of API limits, esp. free tier
-    
-    except Exception as e:
-        logging.error(f"Critical error in main pipeline: {e}", exc_info=True)
-    finally:
-        db.close()
-        logging.info("Odds ingestion pipeline finished.")
-
+    logger.info("Starting WNBA player props scraper.")
+    with get_sync_db_session() as db:
+        try:
+            # The default action is to fetch current player props for upcoming games
+            fetch_and_store_player_props(db)
+            # The commit is now handled by the session context manager
+            logger.info("Database operations completed successfully and committed.")
+        except Exception as e:
+            # The rollback is also handled by the session context manager
+            logger.error(f"An error occurred during the scraping process, changes have been rolled back: {e}")
+            logger.error(traceback.format_exc())
+    logger.info("Scraping finished.")
 
 if __name__ == "__main__":
-    logging.info("Odds API Scraper initialized with new imports and constants.")
-    if ODDS_API_KEY:
-        logging.info("ODDS_API_KEY loaded successfully.")
-    else:
-        logging.error("ODDS_API_KEY is missing. Cannot proceed with API calls.")
-    logging.info(f"Targeting WNBA sport key: {WNBA_SPORT_KEY}")
-    logging.info(f"Regions: {REGIONS}")
-    logging.info(f"Bookmakers: {list(BOOKMAKERS_OF_INTEREST.keys())}")
-    logging.info(f"Total markets configured: {len(ALL_MARKETS)}")
-
-# Remove old placeholder functions and main logic from the original odds_scraper.py
-# The old functions like fetch_game_odds, fetch_player_prop_odds, process_odds_data,
-# and the old main() will be replaced by new logic using The Odds API. 
+    main() 

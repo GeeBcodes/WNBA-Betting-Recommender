@@ -1,8 +1,9 @@
 import uuid
 from datetime import datetime, timezone
-from sqlalchemy import Column, Integer, String, Float, Date, DateTime, ForeignKey, Text, Boolean, UniqueConstraint, JSON
-from sqlalchemy.dialects.postgresql import UUID, JSONB
+from sqlalchemy import (Column, Integer, String, Float, Date, DateTime, ForeignKey, Text, 
+                        Boolean, UniqueConstraint, Index, JSON)
 from sqlalchemy.orm import relationship
+from sqlalchemy.dialects.postgresql import UUID, JSONB
 from .base import Base
 
 class Team(Base):
@@ -11,8 +12,10 @@ class Team(Base):
     team_name = Column(String, unique=True, index=True, nullable=False)
     api_team_id = Column(String, unique=True, nullable=True)
 
-    # Relationship to players is implicitly handled by Player.team backref
-    # Relationship to games as home/away team is handled by Game.home_team_ref/away_team_ref
+    # Relationships defined with back_populates for clarity
+    players = relationship("Player", back_populates="team")
+    home_games = relationship("Game", foreign_keys="Game.home_team_id", back_populates="home_team_ref")
+    away_games = relationship("Game", foreign_keys="Game.away_team_id", back_populates="away_team_ref")
     pbp_events = relationship("PlayByPlayEvent", back_populates="team")
 
 class Player(Base):
@@ -24,7 +27,7 @@ class Player(Base):
     team_id = Column(UUID(as_uuid=True), ForeignKey("teams.id"), nullable=True)
 
     # Relationships
-    team = relationship("Team", backref="players")
+    team = relationship("Team", back_populates="players")
     stats = relationship("PlayerStat", back_populates="player")
     prop_odds = relationship("PlayerProp", back_populates="player")
     pbp_events_as_player1 = relationship("PlayByPlayEvent", foreign_keys="PlayByPlayEvent.player1_id", back_populates="player1")
@@ -76,75 +79,53 @@ class PlayerStat(Base):
     free_throws_attempted = Column(Integer, nullable=True)
     plus_minus = Column(Integer, nullable=True)
 
+    # Added Summed Stats
+    pra = Column(Float, nullable=True)  # Points + Rebounds + Assists
+    points_plus_rebounds = Column(Float, nullable=True)
+    points_plus_assists = Column(Float, nullable=True)
+    rebounds_plus_assists = Column(Float, nullable=True)
+    blocks_plus_steals = Column(Float, nullable=True)
+
+    # Added Quarter-Specific Stats (requires data source)
+    points_q1 = Column(Float, nullable=True)
+    rebounds_q1 = Column(Float, nullable=True)
+    assists_q1 = Column(Float, nullable=True)
+
+    # Added Binary Outcome Flags (requires logic during ETL to populate)
+    did_double_double = Column(Boolean, nullable=True, default=False)
+    did_triple_double = Column(Boolean, nullable=True, default=False)
+
     # Relationship
     player = relationship("Player", back_populates="stats")
     game = relationship("Game", back_populates="stats")
     team = relationship("Team")
 
+    def to_dict(self):
+        return {c.name: getattr(self, c.name) for c in self.__table__.columns}
+
 class Game(Base):
     __tablename__ = "games"
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    external_id = Column(String, unique=True, index=True, nullable=True)
-    home_team_id = Column(UUID(as_uuid=True), ForeignKey("teams.id"), nullable=True)
-    away_team_id = Column(UUID(as_uuid=True), ForeignKey("teams.id"), nullable=True)
+    the_odds_api_game_id = Column(String, unique=True, index=True, nullable=False)
     game_datetime = Column(DateTime(timezone=True), nullable=False)
-    season = Column(Integer, nullable=True, index=True)
+    season = Column(Integer, nullable=False)
+    status = Column(String, nullable=True) # e.g., 'scheduled', 'in_progress', 'completed'
+    
+    home_team_id = Column(UUID(as_uuid=True), ForeignKey("teams.id"), nullable=False)
+    away_team_id = Column(UUID(as_uuid=True), ForeignKey("teams.id"), nullable=False)
+    
     home_score = Column(Integer, nullable=True)
     away_score = Column(Integer, nullable=True)
 
-    # Team Aggregates (NEW)
-    home_team_minutes_played = Column(Float, nullable=True)
-    away_team_minutes_played = Column(Float, nullable=True)
-    home_team_field_goals_made = Column(Integer, nullable=True)
-    away_team_field_goals_made = Column(Integer, nullable=True)
-    home_team_field_goals_attempted = Column(Integer, nullable=True)
-    away_team_field_goals_attempted = Column(Integer, nullable=True)
-    home_team_three_pointers_made = Column(Integer, nullable=True)
-    away_team_three_pointers_made = Column(Integer, nullable=True)
-    home_team_three_pointers_attempted = Column(Integer, nullable=True)
-    away_team_three_pointers_attempted = Column(Integer, nullable=True)
-    home_team_free_throws_made = Column(Integer, nullable=True)
-    away_team_free_throws_made = Column(Integer, nullable=True)
-    home_team_free_throws_attempted = Column(Integer, nullable=True)
-    away_team_free_throws_attempted = Column(Integer, nullable=True)
-    home_team_offensive_rebounds = Column(Integer, nullable=True)
-    away_team_offensive_rebounds = Column(Integer, nullable=True)
-    home_team_defensive_rebounds = Column(Integer, nullable=True)
-    away_team_defensive_rebounds = Column(Integer, nullable=True)
-    home_team_total_rebounds = Column(Integer, nullable=True)
-    away_team_total_rebounds = Column(Integer, nullable=True)
-    home_team_assists = Column(Integer, nullable=True)
-    away_team_assists = Column(Integer, nullable=True)
-    home_team_steals = Column(Integer, nullable=True)
-    away_team_steals = Column(Integer, nullable=True)
-    home_team_blocks = Column(Integer, nullable=True)
-    away_team_blocks = Column(Integer, nullable=True)
-    home_team_turnovers = Column(Integer, nullable=True)
-    away_team_turnovers = Column(Integer, nullable=True)
-    home_team_fouls = Column(Integer, nullable=True)
-    away_team_fouls = Column(Integer, nullable=True)
     home_team_possessions = Column(Float, nullable=True)
     away_team_possessions = Column(Float, nullable=True)
 
-    # Relationships for Game to Team
-    home_team_ref = relationship("Team", foreign_keys=[home_team_id])
-    away_team_ref = relationship("Team", foreign_keys=[away_team_id])
-
-    @property
-    def home_team(self) -> str | None:
-        if self.home_team_ref:
-            return self.home_team_ref.team_name
-        return None
-
-    @property
-    def away_team(self) -> str | None:
-        if self.away_team_ref:
-            return self.away_team_ref.team_name
-        return None
-
-    # Relationship
+    # Relationships
+    home_team_ref = relationship("Team", foreign_keys=[home_team_id], back_populates="home_games")
+    away_team_ref = relationship("Team", foreign_keys=[away_team_id], back_populates="away_games")
+    stats = relationship("PlayerStat", back_populates="game", cascade="all, delete-orphan")
+    player_props = relationship("PlayerProp", back_populates="game")
     odds = relationship("GameOdd", back_populates="game")
-    stats = relationship("PlayerStat", back_populates="game")
     play_by_play_events = relationship("PlayByPlayEvent", back_populates="game", cascade="all, delete-orphan")
 
 class GameOdd(Base):
@@ -168,21 +149,49 @@ class ModelVersion(Base):
     __tablename__ = "model_versions"
 
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    model_name = Column(String, index=True, nullable=False)
     version_name = Column(String, nullable=False, unique=True)
     trained_at = Column(DateTime, default=datetime.utcnow, nullable=False)
     description = Column(String, nullable=True)
-    model_path = Column(String, nullable=True)
+    model_path = Column(String, nullable=False)
+    model_type = Column(String, nullable=False)
     metrics = Column(JSON, nullable=True)
+    parameters = Column(JSON, nullable=True)
+    nonconformity_scores_path = Column(String, nullable=True)
+    nonconformity_scores_clf_path = Column(String, nullable=True)
+    feature_names = Column(JSON, nullable=True)
 
-    predictions = relationship("Prediction", back_populates="model_version")
+    # Define explicit relationships to resolve ambiguity
+    predictions_legacy = relationship("Prediction", foreign_keys="Prediction.model_version_id", back_populates="model_version")
+    predictions_reg = relationship("Prediction", foreign_keys="Prediction.model_version_id_reg", back_populates="model_version_reg")
+    predictions_clf = relationship("Prediction", foreign_keys="Prediction.model_version_id_clf", back_populates="model_version_clf")
+
+    
+
+class PerformanceReport(Base):
+    __tablename__ = 'performance_reports'
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    report_date = Column(DateTime, nullable=False, default=datetime.utcnow)
+    segment_type = Column(String, nullable=False, index=True) # e.g., 'overall', 'by_target_stat'
+    segment_value = Column(String, nullable=False, index=True) # e.g., 'overall', 'points'
+    metrics = Column(JSON, nullable=False) # Stores the dict of calculated metrics
+
+    __table_args__ = (
+        Index('ix_performance_reports_date_type_value', 'report_date', 'segment_type', 'segment_value'),
+    )
+
 
 class Prediction(Base):
     __tablename__ = "predictions"
 
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     player_prop_id = Column(UUID(as_uuid=True), ForeignKey("player_props.id"), nullable=False)
-    model_version_id = Column(UUID(as_uuid=True), ForeignKey("model_versions.id"), nullable=False)
+    model_version_id = Column(UUID(as_uuid=True), ForeignKey("model_versions.id"), nullable=True) # Now nullable
     
+    # New columns for separate model versions
+    model_version_id_reg = Column(UUID(as_uuid=True), ForeignKey("model_versions.id"), nullable=True)
+    model_version_id_clf = Column(UUID(as_uuid=True), ForeignKey("model_versions.id"), nullable=True)
+
     predicted_value = Column(Float, nullable=True)
     predicted_over_probability = Column(Float, nullable=True)
     predicted_under_probability = Column(Float, nullable=True)
@@ -193,8 +202,30 @@ class Prediction(Base):
     outcome = Column(String, nullable=True)  # e.g., 'OVER', 'UNDER', 'PUSH'
     outcome_processed_at = Column(DateTime, nullable=True) # When the outcome was recorded
 
-    player_prop = relationship("PlayerProp", back_populates="predictions")
-    model_version = relationship("ModelVersion", back_populates="predictions")
+    # Fields for ICP Regression Output
+    predicted_value_interval_lower = Column(Float, nullable=True)
+    predicted_value_interval_upper = Column(Float, nullable=True)
+    conformal_confidence_level_regr = Column(Float, nullable=True)
+
+    # Field to store evaluations against multiple lines (standard and alternative)
+    line_evaluations = Column(JSONB, nullable=True)
+
+    # Fields for ICP Classification Output
+    prediction_set = Column(JSONB, nullable=True) # e.g., ["Over"], ["Under"], ["Over", "Under"]
+    over_p_value_calibrated = Column(Float, nullable=True)
+    under_p_value_calibrated = Column(Float, nullable=True)
+    conformal_confidence_level_clf = Column(Float, nullable=True)
+
+    player_prop = relationship(
+        "PlayerProp", 
+        back_populates="predictions",
+        primaryjoin="Prediction.player_prop_id == PlayerProp.id"
+    )
+    
+    # Define explicit relationships to resolve ambiguity
+    model_version = relationship("ModelVersion", foreign_keys=[model_version_id], back_populates="predictions_legacy")
+    model_version_reg = relationship("ModelVersion", foreign_keys=[model_version_id_reg], back_populates="predictions_reg")
+    model_version_clf = relationship("ModelVersion", foreign_keys=[model_version_id_clf], back_populates="predictions_clf")
 
 class Parlay(Base):
     __tablename__ = "parlays"
@@ -228,8 +259,14 @@ class Market(Base):
     __tablename__ = "markets"
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     key = Column(String, unique=True, index=True, nullable=False)
-    description = Column(String, nullable=True)
+    label = Column(String, nullable=True)
     
+    sport_id = Column(UUID(as_uuid=True), ForeignKey("sports.id"), nullable=False, index=True)
+    market_type = Column(String, nullable=True)
+    stat_category = Column(String, nullable=True)
+    has_point = Column(Boolean, nullable=True)
+
+    sport = relationship("Sport", backref="markets")
     game_odds = relationship("GameOdd", back_populates="market")
     player_props = relationship("PlayerProp", back_populates="market")
 
@@ -241,11 +278,16 @@ class PlayerProp(Base):
     bookmaker_id = Column(UUID(as_uuid=True), ForeignKey("bookmakers.id"), nullable=False, index=True)
     market_id = Column(UUID(as_uuid=True), ForeignKey("markets.id"), nullable=False, index=True)
     
-    player_name_api = Column(String, index=True)
-    last_update_api = Column(DateTime(timezone=True))
-    outcomes = Column(JSON)
+    outcomes = Column(JSONB, nullable=True)
 
-    game = relationship("Game")
+    # Structured columns for prop data
+    line = Column(Float, nullable=False)
+    over_price = Column(Float, nullable=True)
+    under_price = Column(Float, nullable=True)
+
+    last_update_api = Column(DateTime(timezone=True))
+
+    game = relationship("Game", back_populates="player_props")
     player = relationship("Player", back_populates="prop_odds")
     bookmaker = relationship("Bookmaker", back_populates="player_props")
     market = relationship("Market", back_populates="player_props")
@@ -253,7 +295,7 @@ class PlayerProp(Base):
     # Add relationship to Prediction
     predictions = relationship("Prediction", back_populates="player_prop", cascade="all, delete-orphan")
 
-    __table_args__ = (UniqueConstraint('game_id', 'player_name_api', 'bookmaker_id', 'market_id', name='_game_player_bookmaker_market_uc'),)
+    __table_args__ = (UniqueConstraint('game_id', 'player_id', 'bookmaker_id', 'market_id', 'line', name='_game_player_bookmaker_market_line_uc'),)
 
 # New Model for Play-By-Play Events
 class PlayByPlayEvent(Base):
@@ -312,16 +354,7 @@ class PlayByPlayEvent(Base):
     updated_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), onupdate=lambda: datetime.now(timezone.utc))
 
     def __repr__(self):
-        return f"<PlayByPlayEvent(id={self.id}, game_id={self.game_id}, period={self.period}, clock='{self.game_clock_display}', type='{self.event_type_text}', text='{self.event_text[:50]}...')>"
-
-# Update existing models to have relationships to PlayByPlayEvent if desired
-# For example, in Game model:
-# play_by_play_events = relationship("PlayByPlayEvent", back_populates="game", cascade="all, delete-orphan")
-# In Player model (though less direct, might be complex due to player1/2/3_id):
-# pbp_events_as_player1 = relationship("PlayByPlayEvent", foreign_keys="[PlayByPlayEvent.player1_id]", back_populates="player1")
-
-# In Team model:
-# pbp_events = relationship("PlayByPlayEvent", back_populates="team")
+        return f"<PlayByPlayEvent game_id={self.game_id} seq={self.sequence_number} type='{self.event_type_text}'>"
 
 class LeagueSeasonAverages(Base):
     __tablename__ = "league_season_averages"

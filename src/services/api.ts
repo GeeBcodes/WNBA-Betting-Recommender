@@ -46,6 +46,13 @@ export interface PlayerStatFull { // Renaming from PlayerStat to avoid confusion
   free_throws_attempted?: number | null;
   plus_minus?: number | null;
 
+  // Add combined stats as optional fields
+  pra?: number | null;
+  points_plus_rebounds?: number | null;
+  points_plus_assists?: number | null;
+  rebounds_plus_assists?: number | null;
+  blocks_plus_steals?: number | null;
+
   player: Player; // Nested Player object
   game: Game;     // Nested Game object
 }
@@ -84,13 +91,21 @@ export interface PlayerProp {
 
 export interface Prediction {
   id: string; 
-  // player_prop_odd_id: string; // This will be replaced by the nested player_prop object
-  // model_version_id: string; // To be removed from display
   predicted_over_probability: number | null; 
   predicted_under_probability: number | null; 
-  // prediction_datetime: string; // To be removed from display
 
   player_prop?: PlayerProp | null; // Nested PlayerProp details
+
+  // ICP Regression fields
+  predicted_value_interval_lower?: number | null;
+  predicted_value_interval_upper?: number | null;
+  conformal_confidence_level_regr?: number | null;
+
+  // ICP Classification fields
+  prediction_set?: string[] | null;
+  over_p_value_calibrated?: number | null;
+  under_p_value_calibrated?: number | null;
+  conformal_confidence_level_clf?: number | null;
 }
 
 // Updated to match backend schemas/parlay.py ParlayCreate & ParlaySelectionDetail

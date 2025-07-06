@@ -1,531 +1,615 @@
+import asyncio
 import sys
 import os
-import argparse # Added
+import argparse
 import logging
-from pathlib import Path # Path is used, ensure it's imported
-import datetime # datetime is used, ensure it's imported
+from pathlib import Path
+import datetime
+from typing import Optional, List, Any
 import uuid
-from typing import Optional, List # Added List
+import traceback
+import optuna
+from scipy.stats import boxcox
+from scipy.special import inv_boxcox
+import joblib
+import pickle
+import math
+import re
+
+import numpy as np
+import pandas as pd
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import aliased,joinedload
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler, OneHotEncoder, FunctionTransformer
+from sklearn.compose import ColumnTransformer
+from sklearn.pipeline import Pipeline
+from sklearn.impute import SimpleImputer
+from sklearn.metrics import mean_absolute_error, r2_score, accuracy_score, roc_auc_score
+import xgboost as xgb
 
 # Add project root to sys.path
-PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
-sys.path.insert(0, PROJECT_ROOT)
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(PROJECT_ROOT))
 
-import pandas as pd
-import numpy as np # Added numpy
-from sklearn.model_selection import TimeSeriesSplit, RandomizedSearchCV # Changed from train_test_split, Added RandomizedSearchCV
-from sklearn.ensemble import RandomForestRegressor # Changed from Classifier
-import xgboost as xgb # Added for XGBoost
-from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score # Changed metrics
-from sklearn.pipeline import Pipeline
-from sklearn.preprocessing import StandardScaler, OneHotEncoder # Added OneHotEncoder
-from sklearn.compose import ColumnTransformer # Added
-from sklearn.impute import SimpleImputer # Added
-import joblib
-
-# Database related imports
-from sqlalchemy.orm import Session, joinedload, aliased # Added joinedload and aliased
-from backend.db.session import SessionLocal
-# Updated CRUD import for model versions
-from backend.app.crud import model_versions as crud_mv
-from backend.db import models as db_models # For querying DB models
-from backend.schemas import model_version as mv_schema # For creating ModelVersion schema
-
-# Import the new shared feature engineering function
+from backend.db.session import AsyncSessionLocal
+from backend.db.models import PlayerStat, Game, Team, ModelVersion, Player
+from backend.schemas.model_version import ModelVersionCreate
+from backend.app.crud.model_versions import create_model_version
 from backend.features.feature_engineering_core import generate_full_feature_set
+from backend.app.core.config import DEFAULT_SEASONS, TARGET_STATS_TO_TRAIN, ROLLING_WINDOWS
 
-# Configure logging
+# Setup logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-logger = logging.getLogger(__name__) # Use a named logger
+logger = logging.getLogger(__name__)
 
-# Define paths
-MODEL_ARTIFACTS_DIR = Path(__file__).parent / "artifacts"
-MODEL_ARTIFACTS_DIR.mkdir(parents=True, exist_ok=True)
+# --- Data Loading ---
+async def load_data(
+    db: AsyncSession,
+    target_stat_type: str,
+    model_type: str,
+    seasons: List[int],
+    game_id: Optional[str] = None,
+) -> pd.DataFrame:
+    """Loads player stats data from the database for the given seasons."""
+    logger.info(f"Loading data for target_stat_type: '{target_stat_type}', model_type: '{model_type}', seasons: {seasons}")
 
-def get_db_session() -> Session:
-    db = SessionLocal()
-    try:
-        return db
-    except Exception as e:
-        logger.error(f"Error creating database session: {e}")
-        if db:
-            db.close()
-        raise
-
-def load_data(db: Session, target_stat: str, seasons: Optional[List[int]] = None) -> pd.DataFrame:
-    """
-    Loads player stats, game, and player data from the database for the specified target stat and seasons.
-    """
-    logger.info(f"Loading data for target stat: '{target_stat}', seasons: {seasons if seasons else 'all'}")
-
-    # Correctly create aliases for the Team table for distinct joins
-    HomeTeamAliased = aliased(db_models.Team, name='home_team_table')
-    AwayTeamAliased = aliased(db_models.Team, name='away_team_table')
+    HomeTeam = aliased(Team, name="home_team")
+    AwayTeam = aliased(Team, name="away_team")
 
     query = (
-        db.query(
-            db_models.PlayerStat.id.label('player_stat_id'),
-            db_models.PlayerStat.player_id,
-            db_models.PlayerStat.game_id,
-            db_models.PlayerStat.minutes_played,
-            getattr(db_models.PlayerStat, target_stat).label(target_stat), 
-            db_models.PlayerStat.is_home_team,
-            db_models.Game.game_datetime,
-            # db_models.Game.home_team, # This was the issue
-            # db_models.Game.away_team, # This was the issue
-            HomeTeamAliased.team_name.label('home_team_name'), # Query name via join
-            AwayTeamAliased.team_name.label('away_team_name'), # Query name via join
-            db_models.Game.season, 
-            db_models.Player.player_name
+        select(
+            PlayerStat.id, PlayerStat.player_id, PlayerStat.team_id, PlayerStat.game_id,
+            PlayerStat.season, PlayerStat.minutes_played, PlayerStat.points, PlayerStat.rebounds,
+            PlayerStat.assists, PlayerStat.steals, PlayerStat.blocks, PlayerStat.turnovers,
+            PlayerStat.field_goals_made, PlayerStat.field_goals_attempted,
+            PlayerStat.three_pointers_made, PlayerStat.three_pointers_attempted,
+            PlayerStat.free_throws_made, PlayerStat.free_throws_attempted,
+            PlayerStat.offensive_rebounds, PlayerStat.defensive_rebounds,
+            PlayerStat.fouls, PlayerStat.player_efficiency_rating,
+            PlayerStat.usage_rate, PlayerStat.true_shooting_percentage,
+            PlayerStat.effective_field_goal_percentage,
+            # Combined stats are calculated below, not loaded directly from DB
+            Game.game_datetime, Game.home_team_id, Game.away_team_id,
+            Game.home_score, Game.away_score,
+            Team.team_name, Player.player_name,
+            HomeTeam.team_name.label("home_team_name"),
+            AwayTeam.team_name.label("away_team_name")
         )
-        .join(db_models.Game, db_models.PlayerStat.game_id == db_models.Game.id)
-        .join(db_models.Player, db_models.PlayerStat.player_id == db_models.Player.id)
-        .join(HomeTeamAliased, db_models.Game.home_team_id == HomeTeamAliased.id) # Join for home team name
-        .join(AwayTeamAliased, db_models.Game.away_team_id == AwayTeamAliased.id) # Join for away team name
+        .join(Game, PlayerStat.game_id == Game.id)
+        .join(Team, PlayerStat.team_id == Team.id)
+        .join(Player, PlayerStat.player_id == Player.id)
+        .join(HomeTeam, Game.home_team_id == HomeTeam.id)
+        .join(AwayTeam, Game.away_team_id == AwayTeam.id)
+        .filter(PlayerStat.season.in_(seasons))
+        .filter(PlayerStat.minutes_played > 0)
     )
 
-    if seasons:
-        query = query.filter(db_models.Game.season.in_(seasons))
+    if game_id:
+        query = query.filter(PlayerStat.game_id == game_id)
 
-    # Add ordering for time-series consistency if needed before df conversion
-    query = query.order_by(db_models.Game.game_datetime, db_models.PlayerStat.player_id)
-    
-    try:
-        df = pd.read_sql_query(query.statement, db.bind)
-        if df.empty:
-            logger.warning(f"No data found for target_stat='{target_stat}' and seasons='{seasons}'.")
-            return pd.DataFrame()
-        logger.info(f"Successfully loaded {len(df)} records from the database.")
-        # Basic data type conversions if necessary (e.g., game_datetime to datetime)
-        df['game_datetime'] = pd.to_datetime(df['game_datetime'])
+
+    result = await db.execute(query)
+    data = result.mappings().all()
+
+    if not data:
+        return pd.DataFrame()
+
+    df = pd.DataFrame(data)
+
+    # --- Calculate combined stats on the fly to ensure they exist with expected short names ---
+    base_cols = ['points', 'rebounds', 'assists', 'steals', 'blocks']
+    for col in base_cols:
+        df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0)
+        
+    df['pra'] = df['points'] + df['rebounds'] + df['assists']
+    df['pr'] = df['points'] + df['rebounds']
+    df['pa'] = df['points'] + df['assists']
+    df['ra'] = df['rebounds'] + df['assists']
+    df['blocks_plus_steals'] = df['blocks'] + df['steals']
+    # ---
+
+    df['opponent_team_id'] = df.apply(
+        lambda row: row['away_team_id'] if str(row['team_id']) == str(row['home_team_id']) else row['home_team_id'],
+        axis=1
+    )
+    return df
+
+async def load_all_player_stats_for_seasons(db: AsyncSession, seasons: List[int]) -> pd.DataFrame:
+    """Loads all player stats for all teams for the given seasons to build team-level features."""
+    logger.info(f"Loading all player stats for seasons: {seasons} for feature generation.")
+
+    query = (
+        select(
+            PlayerStat.team_id,
+            PlayerStat.game_id,
+            Game.game_datetime,
+            Game.home_team_id,
+            Game.away_team_id,
+            PlayerStat.season,
+            PlayerStat.points,
+            PlayerStat.rebounds,
+            PlayerStat.assists,
+            PlayerStat.steals,
+            PlayerStat.blocks,
+            PlayerStat.turnovers,
+            PlayerStat.field_goals_made,
+            PlayerStat.field_goals_attempted,
+            PlayerStat.three_pointers_made,
+            PlayerStat.three_pointers_attempted,
+            PlayerStat.free_throws_made,
+            PlayerStat.free_throws_attempted
+        )
+        .join(Game, PlayerStat.game_id == Game.id)
+        .filter(PlayerStat.season.in_(seasons))
+    )
+    result = await db.execute(query)
+    data = result.mappings().all()
+
+    if not data:
+        return pd.DataFrame()
+
+    df = pd.DataFrame(data)
+
+    # Determine opponent team ID for each player stat record
+    df['opponent_team_id'] = df.apply(
+        lambda row: row['away_team_id'] if str(row['team_id']) == str(row['home_team_id']) else row['home_team_id'],
+        axis=1
+    )
+    return df
+
+def generate_synthetic_prop_line(df: pd.DataFrame, target_stat: str) -> pd.DataFrame:
+    """
+    Generates a synthetic prop line for each game to enable classification training.
+    This creates a binary target variable (Over/Under).
+    """
+    logger.info("Generating synthetic prop_line for classification model training...")
+
+    valid_stats = df[target_stat].dropna()
+
+    if valid_stats.empty:
+        logger.warning(f"No valid data points found for '{target_stat}' to generate prop lines.")
+        df['prop_line'] = np.nan
+        df['target'] = np.nan
         return df
-    except Exception as e:
-        logger.error(f"Error loading data from database: {e}", exc_info=True)
-        return pd.DataFrame()
 
-def get_team_defensive_rolling_averages(
-    db: Session, 
-    target_stat: str, 
-    seasons: Optional[List[int]] = None, 
-    window_size: int = 10, 
-    min_periods: int = 3,
-    all_player_stats_df: Optional[pd.DataFrame] = None
-) -> pd.DataFrame:
-    """
-    Calculates for each team, their rolling average of a specific stat they have conceded to opponents 
-    leading up to each game.
-    Can use a pre-fetched DataFrame or query the database.
-    Args:
-        db: SQLAlchemy session, used if all_player_stats_df is None.
-        target_stat: The target statistic.
-        seasons: List of seasons, used if all_player_stats_df is None.
-        window_size: Rolling window size.
-        min_periods: Minimum periods for rolling calculation.
-        all_player_stats_df: Optional pre-fetched DataFrame. Expected columns:
-                             game_id, {target_stat} (as 'stat_value'), is_home_team, 
-                             game_datetime, game_home_team_name, game_away_team_name.
-    """
-    logger.info(f"Calculating team defensive rolling averages for '{target_stat}' over {window_size} games (min {min_periods} periods).")
+    quantiles = np.quantile(valid_stats, q=[0.1, 0.25, 0.5, 0.75, 0.9])
+    quantiles = np.maximum(0, quantiles)
 
-    if all_player_stats_df is not None and not all_player_stats_df.empty:
-        logger.info("Using provided DataFrame for defensive rolling averages calculation.")
-        # Ensure target_stat column is named 'stat_value' for consistent processing, or adapt logic.
-        # The historical_team_context_df in predictor already has target_stat named correctly.
-        # And it also has game_home_team_name, game_away_team_name.
-        required_cols_from_df = ['game_id', target_stat, 'is_home_team', 'game_datetime', 'game_home_team_name', 'game_away_team_name']
-        if not all(col in all_player_stats_df.columns for col in required_cols_from_df):
-            missing = [col for col in required_cols_from_df if col not in all_player_stats_df.columns]
-            logger.error(f"Provided DataFrame is missing required columns for defensive averages: {missing}. Cannot proceed with DataFrame.")
-            return pd.DataFrame() # Or fall back to DB query if desired, but for now, error out if expected DF is bad.
-        
-        stats_df = all_player_stats_df.rename(columns={target_stat: 'stat_value'}).copy() # Use the target_stat column as 'stat_value'
-    
-    elif all_player_stats_df is not None and all_player_stats_df.empty:
-        logger.warning("Provided DataFrame for defensive rolling averages is empty. Returning empty DataFrame.")
-        return pd.DataFrame()
-        
+    if np.var(quantiles) < 1e-6:
+        base_line = valid_stats.mean()
+        prop_lines = np.random.choice([max(0.5, base_line - 0.5), max(0.5, base_line + 0.5)], size=len(df))
     else:
-        logger.info(f"No DataFrame provided, querying database for defensive rolling averages. Seasons: {seasons if seasons else 'all'}")
-        HomeTeamAliased = aliased(db_models.Team, name='home_team_conceded_calc')
-        AwayTeamAliased = aliased(db_models.Team, name='away_team_conceded_calc')
+        noise = np.random.normal(0, 0.1, size=len(df))
+        base_lines = np.random.choice(quantiles, size=len(df))
+        prop_lines = np.round((base_lines + noise) * 2) / 2
 
-        query = (
-            db.query(
-                db_models.PlayerStat.game_id,
-                getattr(db_models.PlayerStat, target_stat).label('stat_value'),
-                db_models.PlayerStat.is_home_team, 
-                db_models.Game.game_datetime,
-                HomeTeamAliased.team_name.label('game_home_team_name'),
-                AwayTeamAliased.team_name.label('game_away_team_name')
-            )
-            .join(db_models.Game, db_models.PlayerStat.game_id == db_models.Game.id)
-            .join(HomeTeamAliased, db_models.Game.home_team_id == HomeTeamAliased.id)
-            .join(AwayTeamAliased, db_models.Game.away_team_id == AwayTeamAliased.id)
-            .filter(getattr(db_models.PlayerStat, target_stat).isnot(None))
-        )
+    df['prop_line'] = np.maximum(0.5, prop_lines)
+    df['target'] = (df[target_stat] > df['prop_line']).astype(int)
+    df.dropna(subset=[target_stat], inplace=True)
+    logger.info(f"Class balance - Over: {df['target'].sum()}, Under: {len(df) - df['target'].sum()}")
+    logger.info(f"DataFrame size after generating synthetic prop_line and dropping NaNs: {len(df)}")
+    return df
 
-        if seasons:
-            query = query.filter(db_models.Game.season.in_(seasons))
+# --- NEW LEAKAGE_MAP AND HELPER FUNCTION ---
+LEAKAGE_MAP = {
+    'points': {
+        'direct_components': {'field_goals_made', 'free_throws_made', 'three_pointers_made'},
+        'advanced_metrics': {'player_efficiency_rating', 'true_shooting_percentage', 'effective_field_goal_percentage', 'usage_rate', 'points_per_40_min'}
+    },
+    'rebounds': {
+        'direct_components': {'offensive_rebounds', 'defensive_rebounds'},
+        'advanced_metrics': {'player_efficiency_rating', 'defensive_rebound_percentage', 'offensive_rebound_percentage', 'total_rebound_percentage', 'rebounds_per_40_min'}
+    },
+    'assists': {
+        'direct_components': set(),
+        'advanced_metrics': {'player_efficiency_rating', 'assist_percentage', 'assist_to_turnover_ratio', 'assists_per_40_min'}
+    },
+    'steals': {
+        'direct_components': set(),
+        'advanced_metrics': {'player_efficiency_rating', 'steals_per_40_min'}
+    },
+    'blocks': {
+        'direct_components': set(),
+        'advanced_metrics': {'player_efficiency_rating', 'block_percentage', 'blocks_per_40_min'}
+    },
+    'turnovers': {
+        'direct_components': set(),
+        'advanced_metrics': {'player_efficiency_rating', 'turnover_percentage', 'assist_to_turnover_ratio'}
+    },
+    'field_goals_made': {
+        'direct_components': {'points'},
+        'advanced_metrics': {'player_efficiency_rating', 'effective_field_goal_percentage', 'true_shooting_percentage', 'usage_rate'}
+    },
+    'three_pointers_made': {
+        'direct_components': {'points', 'field_goals_made'},
+        'advanced_metrics': {'player_efficiency_rating', 'effective_field_goal_percentage', 'true_shooting_percentage'}
+    },
+    'pra': {'direct_components': {'points', 'rebounds', 'assists'}},
+    'pr': {'direct_components': {'points', 'rebounds'}},
+    'pa': {'direct_components': {'points', 'assists'}},
+    'ra': {'direct_components': {'rebounds', 'assists'}},
+    'blocks_plus_steals': {'direct_components': {'blocks', 'steals'}},
+}
 
-        try:
-            stats_df = pd.read_sql_query(query.statement, db.bind)
-            if stats_df.empty:
-                logger.warning(f"No player stats found from DB for defensive average calculation (target_stat='{target_stat}', seasons='{seasons}').")
-                return pd.DataFrame()
-        except Exception as e:
-            logger.error(f"Error loading player stats from DB for defensive averages: {e}", exc_info=True)
-            return pd.DataFrame()
+STAT_COMPONENTS = {
+    'pra': {'points', 'rebounds', 'assists'},
+    'pr': {'points', 'rebounds'},
+    'pa': {'points', 'assists'},
+    'ra': {'rebounds', 'assists'},
+    'blocks_plus_steals': {'blocks', 'steals'},
+}
 
-    # Determine the defending team for each stat entry
-    stats_df['defending_team_name'] = np.where(
-        stats_df['is_home_team'], 
-        stats_df['game_away_team_name'], 
-        stats_df['game_home_team_name']
-    )
+for base_stat, details in list(LEAKAGE_MAP.items()):
+    if 'direct_components' in details:
+        for combo_stat, combo_details in LEAKAGE_MAP.items():
+            if 'direct_components' in combo_details and base_stat in combo_details['direct_components']:
+                if 'part_of_combos' not in details:
+                    details['part_of_combos'] = set()
+                details['part_of_combos'].add(combo_stat)
 
-    # Sum the target_stat conceded by the defending_team in each game
-    conceded_per_game_df = stats_df.groupby(['game_id', 'defending_team_name', 'game_datetime'])['stat_value'].sum().reset_index()
-    conceded_per_game_df.rename(columns={'stat_value': f'total_{target_stat}_conceded_in_game'}, inplace=True)
-    
-    # Sort by team and then by game date to prepare for rolling average calculation
-    conceded_per_game_df = conceded_per_game_df.sort_values(by=['defending_team_name', 'game_datetime'])
-
-    # Calculate rolling average of stat conceded, shifted to prevent data leakage from current game
-    conceded_per_game_df[f'opponent_{target_stat}_conceded_roll_avg'] = (
-        conceded_per_game_df.groupby('defending_team_name')[f'total_{target_stat}_conceded_in_game']
-        .transform(lambda x: x.rolling(window=window_size, min_periods=min_periods).mean().shift(1))
-    )
-
-    # Select relevant columns to return
-    # We need game_datetime to join correctly in feature_engineering if multiple games for a team on same day (unlikely for opponent stats, but good practice)
-    result_df = conceded_per_game_df[['game_id', 'defending_team_name', 'game_datetime', f'opponent_{target_stat}_conceded_roll_avg']]
-    
-    logger.info(f"Successfully calculated team defensive rolling averages for {target_stat}. Resulting df shape: {result_df.shape}")
-    return result_df
-
-def get_team_performance_rolling_averages(db: Session, target_stat: str, all_player_stats_df_for_points: pd.DataFrame, seasons: Optional[List[int]] = None, window_size: int = 10, min_periods: int = 3) -> pd.DataFrame:
+def get_leaky_features_for_target(target_stat: str) -> set:
     """
-    Calculates for each team, their rolling average of team performance (target_stat and total points) 
-    leading up to each game.
-    Uses a pre-fetched DataFrame of all player stats to avoid re-querying for total points calculation if target_stat is different.
+    Identifies all features that could cause data leakage for a given target statistic.
+    This includes:
+    1. The direct component stats (e.g., 'points' for 'pr').
+    2. Other combined stats that share components (e.g., 'pa' is leaky for 'pr').
+    3. Advanced metrics calculated from the target or its components.
     """
-    logger.info(f"Calculating team performance rolling averages for '{target_stat}' and total points over {window_size} games (min {min_periods} periods). Seasons: {seasons if seasons else 'all'}")
+    leaky_features = set()
 
-    # Determine player's actual team for each stat entry
-    # This reuses the logic from get_team_defensive_rolling_averages for identifying team names if we passed in the raw stats_df
-    # For broader utility, this function should fetch its own base data or accept a generic player_stats_df.
-    # For now, we will use the passed all_player_stats_df_for_points which should have game_home_team_name, game_away_team_name, is_home_team, points, and target_stat columns.
+    # Get the base components of the target_stat, if it's a combined stat.
+    # If not a combined stat, its only component is itself (e.g., 'points').
+    target_components = STAT_COMPONENTS.get(target_stat, {target_stat})
 
-    # Ensure required columns are present (adjust if all_player_stats_df_for_points has different naming)
-    required_cols = ['game_id', 'game_datetime', 'is_home_team', 'game_home_team_name', 'game_away_team_name', target_stat, 'points'] # 'points' for team total points
-    if not all(col in all_player_stats_df_for_points.columns for col in required_cols):
-        missing = [col for col in required_cols if col not in all_player_stats_df_for_points.columns]
-        logger.error(f"Missing required columns in all_player_stats_df_for_points for team performance calculation: {missing}. Skipping.")
-        return pd.DataFrame()
+    # 1. Find all other combined stats that share any component with our target.
+    # This finds siblings, like 'pa' when target is 'pr'.
+    for combo_stat, components in STAT_COMPONENTS.items():
+        if combo_stat != target_stat and not target_components.isdisjoint(components):
+            leaky_features.add(combo_stat)
 
-    # Make a copy to avoid modifying the original DataFrame passed in
-    team_stats_df = all_player_stats_df_for_points.copy()
-
-    team_stats_df['player_actual_team_name'] = np.where(
-        team_stats_df['is_home_team'], 
-        team_stats_df['game_home_team_name'], 
-        team_stats_df['game_away_team_name']
-    )
-
-    # Sum the target_stat and total points for each team in each game
-    # Need to ensure 'points' column exists from PlayerStat for total team points.
-    # We assume target_stat column already has the specific stat value for each player.
-    team_game_performance = team_stats_df.groupby(['game_id', 'player_actual_team_name', 'game_datetime']).agg(
-        team_total_target_stat_in_game=(target_stat, 'sum'),
-        team_total_points_in_game=('points', 'sum') # Assuming 'points' is the column name for player points
-    ).reset_index()
+    # 2. Add all base components of the target stat itself.
+    # For 'pra', this adds 'points', 'rebounds', and 'assists'.
+    leaky_features.update(target_components)
     
-    # Sort by team and then by game date for rolling average
-    team_game_performance = team_game_performance.sort_values(by=['player_actual_team_name', 'game_datetime'])
-
-    # Calculate rolling average of team's own target_stat performance
-    team_game_performance[f'team_{target_stat}_roll_avg'] = (
-        team_game_performance.groupby('player_actual_team_name')['team_total_target_stat_in_game']
-        .transform(lambda x: x.rolling(window=window_size, min_periods=min_periods).mean().shift(1))
-    )
+    # 3. Recursively find components of components and their associated advanced metrics.
+    stats_to_check = set(target_components)
+    processed_stats = set()
     
-    # Calculate rolling average of team's own total points performance
-    team_game_performance[f'team_total_points_roll_avg'] = (
-        team_game_performance.groupby('player_actual_team_name')['team_total_points_in_game']
-        .transform(lambda x: x.rolling(window=window_size, min_periods=min_periods).mean().shift(1))
-    )
+    while stats_to_check:
+        stat = stats_to_check.pop()
+        if stat in processed_stats:
+            continue
+        processed_stats.add(stat)
 
-    result_df = team_game_performance[[
-        'game_id', 'player_actual_team_name', 'game_datetime', 
-        f'team_{target_stat}_roll_avg', f'team_total_points_roll_avg'
-    ]]
+        if stat in LEAKAGE_MAP:
+            details = LEAKAGE_MAP[stat]
+            # Add direct components and advanced metrics from the map.
+            new_components = details.get('direct_components', set())
+            leaky_features.update(new_components)
+            leaky_features.update(details.get('advanced_metrics', set()))
+            # Add the newly found components to the set to be checked recursively.
+            stats_to_check.update(new_components)
+
+    # The target stat itself should NEVER be in the list of features to remove.
+    # This is the crucial fix for the "Target column not found" error.
+    leaky_features.discard(target_stat)
     
-    logger.info(f"Successfully calculated team performance rolling averages. Resulting df shape: {result_df.shape}")
-    return result_df
+    return leaky_features
 
-def get_preprocessor(numerical_features: List[str], categorical_features: List[str]) -> ColumnTransformer:
-    """
-    Creates a scikit-learn ColumnTransformer for preprocessing.
-    """
-    numerical_transformer = Pipeline(steps=[
-        ('imputer', SimpleImputer(strategy='mean')),
+def convert_numpy_types(obj: Any) -> Any:
+    """Recursively convert numpy types and handle non-finite numbers for JSON serialization."""
+    if isinstance(obj, dict):
+        return {k: convert_numpy_types(v) for k, v in obj.items()}
+    elif isinstance(obj, list):
+        return [convert_numpy_types(i) for i in obj]
+    elif isinstance(obj, (np.int_, np.intc, np.intp, np.int8,
+                          np.int16, np.int32, np.int64, np.uint8,
+                          np.uint16, np.uint32, np.uint64)):
+        return int(obj)
+    elif isinstance(obj, (np.float_, np.float16, np.float32, np.float64, float)): # Added standard float
+        # Handle NaN, Infinity, -Infinity
+        if not math.isfinite(obj):
+            return None # Replace non-finite numbers with None (which becomes null in JSON)
+        return float(obj)
+    elif isinstance(obj, np.ndarray):
+        return obj.tolist()
+    return obj
+
+
+# --- Model Training ---
+async def train_and_evaluate_model(
+    df: pd.DataFrame,
+    target_stat: str,
+    model_type: str,
+    seasons: List[int],
+    db_session: AsyncSession,
+    apply_box_cox: bool = False
+) -> bool:
+    """Trains a model, saves artifacts, and records metadata."""
+
+    # --- Prevent Data Leakage ---
+    # This is a critical step to prevent the model from "cheating" by using features
+    # that are direct components or combinations of the target variable.
+
+    # Get the list of stats that would leak information for the current target.
+    # This set does NOT include the target_stat itself.
+    leaky_base_stats = get_leaky_features_for_target(target_stat)
+    leaky_columns = set()
+
+    # Find columns containing leaky base stats. We use a regex with word boundaries (\b)
+    # to prevent dropping 'pra' just because 'pr' is in the leaky set.
+    if leaky_base_stats:
+        pattern = r'\b(' + '|'.join(re.escape(s) for s in leaky_base_stats) + r')\b'
+        leaky_columns.update({col for col in df.columns if re.search(pattern, col)})
+
+    # Also, explicitly find and add derived features of the target stat itself,
+    # like 'pra_rolling_10', being careful not to add the target 'pra' itself.
+    for col in df.columns:
+        if col.startswith(f"{target_stat}_"):
+            leaky_columns.add(col)
+
+    # For classification models, we must also remove the 'prop_line'
+    if model_type == 'classification' and 'prop_line' in df.columns:
+        leaky_columns.add('prop_line')
+    
+    # The target should never be dropped. As a final safeguard, remove it if it's present.
+    leaky_columns.discard(target_stat)
+
+    if leaky_columns:
+        sorted_leaky_columns = sorted(list(leaky_columns))
+        logger.info(f"Dropping columns to prevent data leakage: {sorted_leaky_columns}")
+        df.drop(columns=sorted_leaky_columns, inplace=True, errors='ignore')
+
+
+    logger.info(f"Starting training process for {target_stat} ({model_type})...")
+    target_column = 'target' if model_type == 'classification' else target_stat
+
+    if target_column not in df.columns:
+        logger.error(f"Target column '{target_column}' not found in DataFrame. Aborting.")
+        return False
+    
+    # Drop rows where the target is NaN
+    df.dropna(subset=[target_column], inplace=True)
+    if df.empty:
+        logger.error(f"DataFrame is empty after dropping NaNs in target column '{target_column}'. Aborting.")
+        return False
+
+    # Store original y_test for classification evaluation
+    y_test_original = None
+    if model_type == 'classification':
+        y_test_original = df.loc[df.index.isin(df.sample(frac=0.15, random_state=42).index), target_column].copy()
+
+    # --- Box-Cox Transformation (for regression) ---
+    lmbda = None
+    if model_type == 'regression' and apply_box_cox:
+        logger.info("Applying Box-Cox transformation to the training target variable.")
+        # Ensure target column is numeric and positive for Box-Cox
+        y_train_series = df[target_column]
+        if pd.to_numeric(y_train_series, errors='coerce').gt(0).all():
+            y_train_transformed, lmbda = boxcox(y_train_series)
+            df[target_column] = y_train_transformed
+        else:
+            logger.warning("Training target variable contains non-positive values. Skipping Box-Cox transformation.")
+
+    y = df[target_column]
+    X = df.drop(columns=[target_column], errors='ignore')
+    X.columns = pd.Index([str(col) for col in X.columns])
+    
+    # --- Data Splitting (Train/Calibration/Test) ---
+    X_train_calib, X_test, y_train_calib, y_test = train_test_split(X, y, test_size=0.15, random_state=42)
+    X_train, X_calib, y_train, y_calib = train_test_split(X_train_calib, y_train_calib, test_size=0.2, random_state=42) # 0.2 * 0.85 = 0.17
+
+    logger.info(f"Data split: {len(y_train)} train, {len(y_calib)} calibration, {len(y_test)} test samples.")
+
+    # --- Feature Preprocessing ---
+    # Explicitly drop ID and other non-feature columns before they enter the pipeline
+    non_feature_cols = ['id', 'player_id', 'game_id', 'team_id', 'opponent_team_id', 'player_name', 'team_name', 'home_team_name', 'away_team_name', 'game_datetime', 'season']
+    if model_type == 'classification':
+        non_feature_cols.append(target_stat) # Drop the original stat column for classification
+        
+    X_train = X_train.drop(columns=[col for col in non_feature_cols if col in X_train.columns], errors='ignore')
+    X_calib = X_calib.drop(columns=[col for col in non_feature_cols if col in X_calib.columns], errors='ignore')
+    X_test = X_test.drop(columns=[col for col in non_feature_cols if col in X_test.columns], errors='ignore')
+
+    numerical_features = X_train.select_dtypes(include=np.number).columns.tolist()
+    categorical_features = X_train.select_dtypes(include=['object', 'category']).columns.tolist()
+
+    # Ensure all feature names are strings before creating the ColumnTransformer
+    numerical_features = [str(col) for col in numerical_features]
+    categorical_features = [str(col) for col in categorical_features]
+    
+    final_feature_names = numerical_features + categorical_features
+
+    logger.info(f"Using {len(numerical_features)} numerical features and {len(categorical_features)} categorical features.")
+
+    numeric_transformer = Pipeline(steps=[
+        ('imputer', SimpleImputer(strategy='median')),
         ('scaler', StandardScaler())
     ])
-
     categorical_transformer = Pipeline(steps=[
-        ('imputer', SimpleImputer(strategy='most_frequent')), # Or 'constant' fill_value='missing'
+        ('imputer', SimpleImputer(strategy='most_frequent')),
         ('onehot', OneHotEncoder(handle_unknown='ignore'))
     ])
-
     preprocessor = ColumnTransformer(
         transformers=[
-            ('num', numerical_transformer, numerical_features),
+            ('num', numeric_transformer, numerical_features),
             ('cat', categorical_transformer, categorical_features)
         ],
-        remainder='drop' # Or 'passthrough' if other columns are needed and handled
+        remainder='drop'
     )
-    return preprocessor
-
-def train_and_evaluate_model(df: pd.DataFrame, target_stat: str):
-    """Trains a regression model and evaluates it using TimeSeriesSplit."""
-    logger.info(f"Starting model training and evaluation for {target_stat}...")
     
-    if df.empty or target_stat not in df.columns:
-        logger.error(f"DataFrame is empty or target_stat '{target_stat}' column is missing. Skipping training.")
-        return None, None
+    # --- Model Definition ---
+    if model_type == 'regression':
+        model = xgb.XGBRegressor(objective='reg:squarederror', random_state=42)
+    else: # classification
+        model = xgb.XGBClassifier(objective='binary:logistic', eval_metric='logloss', use_label_encoder=False, random_state=42)
 
-    # Ensure target is numeric and handle NaNs if any (should ideally be clean)
-    df = df.dropna(subset=[target_stat]) 
-    if df.empty:
-        logger.error(f"DataFrame empty after dropping NaNs in target '{target_stat}'. Skipping training.")
-        return None, None
-
-    y = df[target_stat]
-    # Define features: Exclude IDs, date/datetime, and the target itself
-    # Explicitly list features to be used or columns to be dropped
-    X = df.drop(columns=[target_stat, 'player_stat_id', 'player_id', 'game_id', 'game_datetime', 'player_name']) # Adjust as necessary
-
-    if X.empty:
-        logger.error("Feature set X is empty. Check feature engineering and column drops. Skipping training.")
-        return None, None
-
-    # Identify numerical and categorical features from X's columns
-    numerical_features = X.select_dtypes(include=np.number).columns.tolist()
-    categorical_features = X.select_dtypes(exclude=np.number).columns.tolist() # Or include=['object', 'category']
-
-    logger.info(f"Numerical features for preprocessing: {numerical_features}")
-    logger.info(f"Categorical features for preprocessing: {categorical_features}")
-
-    if not numerical_features and not categorical_features:
-        logger.error("No numerical or categorical features identified for the preprocessor. Skipping training.")
-        return None, None
-        
-    preprocessor = get_preprocessor(numerical_features, categorical_features)
+    best_pipeline = Pipeline(steps=[('preprocessor', preprocessor), ('model', model)])
     
-    # Define the model (XGBRegressor) - hyperparameters will be tuned
-    xgb_model = xgb.XGBRegressor(objective='reg:squarederror', random_state=42, n_jobs=-1)
-    
-    pipeline = Pipeline(steps=[('preprocessor', preprocessor),
-                               ('regressor', xgb_model)])
-    
-    # Define the hyperparameter distribution for RandomizedSearchCV
-    # Note: parameters for the regressor step in the pipeline must be prefixed with 'regressor__'
-    param_dist = {
-        'regressor__n_estimators': [100, 200, 300, 500],
-        'regressor__learning_rate': [0.01, 0.05, 0.1, 0.2],
-        'regressor__max_depth': [3, 5, 7, 9],
-        'regressor__subsample': [0.7, 0.8, 0.9, 1.0], # Fraction of samples used for fitting the individual base learners
-        'regressor__colsample_bytree': [0.7, 0.8, 0.9, 1.0], # Fraction of features used for fitting the individual base learners
-        'regressor__gamma': [0, 0.1, 0.2, 0.3] # Minimum loss reduction required to make a further partition
-    }
-    
-    tscv = TimeSeriesSplit(n_splits=5)
-    
-    # Setup RandomizedSearchCV
-    # Using neg_mean_squared_error as scoring because RandomizedSearchCV tries to maximize the score
-    random_search = RandomizedSearchCV(
-        estimator=pipeline,
-        param_distributions=param_dist,
-        n_iter=20,  # Number of parameter settings that are sampled. Increase for more thorough search.
-        scoring='neg_mean_squared_error',
-        cv=tscv,
-        random_state=42,
-        n_jobs=-1, # Use all available cores, be mindful if preprocessor also uses n_jobs
-        verbose=1 # Logs the progress
-    )
+    logger.info("Fitting model pipeline on the training set...")
+    best_pipeline.fit(X_train, y_train)
 
-    logger.info("Starting RandomizedSearchCV for hyperparameter tuning...")
-    random_search.fit(X, y)
-
-    logger.info(f"Best hyperparameters found: {random_search.best_params_}")
-    
-    # The best_estimator_ is already refitted on the whole training data by RandomizedSearchCV
-    best_pipeline = random_search.best_estimator_
-    
-    # To get evaluation metrics, we can predict on the test sets of the CV folds
-    # Or, more simply for now, report the best score from the search
-    # Note: random_search.best_score_ will be negative (e.g., -MSE).
-    best_cv_mse = -random_search.best_score_ 
-    logger.info(f"Best CV MSE from RandomizedSearchCV: {best_cv_mse:.4f}")
-
-    # For a more complete set of metrics similar to before, we'd ideally re-evaluate the best_pipeline
-    # on the TimeSeriesSplit folds. However, RandomizedSearchCV's `cv_results_` can provide this.
-    # For simplicity here, we'll use the reported best_score_ as a proxy for avg_mse.
-    # A proper evaluation would involve getting MAE and R2 with the best model on the splits.
-    # Let's make a placeholder for other metrics. A full re-evaluation on splits would be more robust.
-    
-    # Re-calculating all metrics on the best model using the same CV splits (optional, for detailed reporting)
-    # This is more complex as it requires iterating through tscv.split(X) again with the best_pipeline.
-    # For now, we primarily rely on random_search.best_score_ for MSE.
-    # We can enhance this later if needed to get MAE and R2 for the *best* model from the same CV splits.
-    
-    # For now, let's construct the metrics dictionary based on the best score and log the best params
-    # This is a simplification. True average MAE/R2 for the *best* model would require re-running CV.
-    avg_metrics = {
-        'best_cv_mse': best_cv_mse,
-        'avg_mae': None, # Placeholder - would need to re-evaluate best model on CV splits
-        'avg_r2': None,  # Placeholder - would need to re-evaluate best model on CV splits
-        'best_params': random_search.best_params_
-    }
-    logger.info(f"Average Cross-Validation Metrics for {target_stat} (using best XGBoost model):")
-    logger.info(f"  Best CV MSE: {avg_metrics['best_cv_mse']:.4f} (from RandomizedSearch)")
-    
-    # The best_pipeline is already trained on the full data used in RandomizedSearch (X, y)
-    # No explicit pipeline.fit(X,y) is needed here for best_pipeline from RandomizedSearchCV if refit=True (default)
-    logger.info("Final model (best_pipeline from RandomizedSearchCV) is ready.")
-
-    return best_pipeline, avg_metrics
-
-
-def save_model_artifact_and_metadata(db: Session, model_pipeline: Pipeline, target_stat: str, metrics: dict):
-    """Saves the trained pipeline and its metadata."""
-    if model_pipeline is None:
-        logger.warning("No model pipeline to save.")
-        return None
-
-    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    model_version_name = f"{target_stat}_model_v{timestamp}" # Incorporate target_stat
-    artifact_filename = f"{model_version_name}.joblib"
-    artifact_path = MODEL_ARTIFACTS_DIR / artifact_filename
-    
-    logger.info(f"Saving model artifact to {artifact_path}")
-    joblib.dump(model_pipeline, artifact_path)
-    logger.info("Model artifact saved successfully.")
-
-    # Create ModelVersion entry in the database
-    model_version_data = mv_schema.ModelVersionCreate(
-        version_name=model_version_name,
-        description=f"XGBRegressor for {target_stat} (tuned). Trained: {timestamp}. Avg Metrics: {metrics}",
-        model_path=str(artifact_path.relative_to(PROJECT_ROOT)), # Store relative path from project root
-        metrics=metrics, # Store the metrics dict
-        # parameters: Optional - can store model hyperparameters or feature list used
-    )
+    # --- Get final feature names AFTER fitting the preprocessor ---
     try:
-        # Use the imported crud_mv for creating model version
-        db_model_version = crud_mv.create_model_version(db=db, model_version=model_version_data)
-        logger.info(f"Successfully created ModelVersion record with ID: {db_model_version.id} and Name: {db_model_version.version_name}")
-        return db_model_version
+        # Access the preprocessor step from the final pipeline
+        preprocessor_step = best_pipeline.named_steps['preprocessor']
+        final_feature_names_from_pipeline = preprocessor_step.get_feature_names_out()
+        logger.info(f"Successfully extracted {len(final_feature_names_from_pipeline)} feature names from pipeline. First 5: {final_feature_names_from_pipeline[:5]}")
     except Exception as e:
-        logger.error(f"Failed to create ModelVersion record in DB: {e}", exc_info=True)
-        return None
+        logger.error(f"Could not get feature names from pipeline's preprocessor: {e}")
+        # As a fallback, use the feature names list generated before fitting
+        final_feature_names_from_pipeline = final_feature_names
+        logger.warning("Using pre-fitting feature names as a fallback.")
 
-def main(args):
-    """Main function to orchestrate data loading, training, and saving."""
-    logger.info(f"Starting the model training pipeline for target_stat: {args.target_stat}...")
-    
-    db: Optional[Session] = None
-    try:
-        db = get_db_session()
-        
-        seasons_list = [int(s.strip()) for s in args.seasons.split(',')] if args.seasons else None
-        
-        # Load raw data for all players and games (main dataset for features)
-        df_raw = load_data(db, target_stat=args.target_stat, seasons=seasons_list)
-        
-        if df_raw.empty:
-            logger.error("Data loading returned empty DataFrame. Exiting pipeline.")
-            return
-            
-        # Prepare base data for team performance calculation (needs all player stats for aggregation)
-        # We need a version of player stats that includes 'points' for team total points, and the target_stat.
-        # This means load_data might need to be more flexible or we run it twice if target_stat is not points.
-        # For now, assume df_raw (which is based on target_stat) also contains a 'points' column if different, 
-        # or that get_team_performance_rolling_averages can handle if target_stat is 'points'.
-        # A cleaner way would be for get_team_performance_rolling_averages to fetch its own broad player stats data.
-        # Let's fetch a specific dataset for this that includes `points` and the current `target_stat` from PlayerStat model.
-        
-        # Query for all player stats needed for team performance aggregation
-        # (game_id, game_datetime, is_home_team, home_team_name, away_team_name, target_stat value, points value)
-        HomeTeamAliased = aliased(db_models.Team, name='home_team_perf_calc')
-        AwayTeamAliased = aliased(db_models.Team, name='away_team_perf_calc')
-        query_cols = [
-            db_models.PlayerStat.game_id,
-            db_models.PlayerStat.is_home_team,
-            db_models.Game.game_datetime,
-            HomeTeamAliased.team_name.label('game_home_team_name'),
-            AwayTeamAliased.team_name.label('game_away_team_name'),
-            getattr(db_models.PlayerStat, args.target_stat).label(args.target_stat), # Current target stat
-            db_models.PlayerStat.points # Always include points for team total points
-        ]
-        # Ensure target_stat isn't added twice if it's 'points'
-        if args.target_stat == 'points':
-            query_cols.pop(-2) # Remove the getattr one, keep the explicit db_models.PlayerStat.points
-            
-        base_team_stats_query = (
-            db.query(*query_cols)
-            .join(db_models.Game, db_models.PlayerStat.game_id == db_models.Game.id)
-            .join(HomeTeamAliased, db_models.Game.home_team_id == HomeTeamAliased.id)
-            .join(AwayTeamAliased, db_models.Game.away_team_id == AwayTeamAliased.id)
-            .filter(getattr(db_models.PlayerStat, args.target_stat).isnot(None))
-            .filter(db_models.PlayerStat.points.isnot(None))
-        )
-        if seasons_list:
-            base_team_stats_query = base_team_stats_query.filter(db_models.Game.season.in_(seasons_list))
-        
-        df_for_team_perf_calc = pd.read_sql_query(base_team_stats_query.statement, db.bind)
-        
-        # Get opponent defensive rolling averages
-        df_opponent_defense_ravg = get_team_defensive_rolling_averages(db, target_stat=args.target_stat, seasons=seasons_list, all_player_stats_df=df_for_team_perf_calc.copy())
-        
-        # Get team's own performance rolling averages
-        df_team_performance_ravg = get_team_performance_rolling_averages(db, target_stat=args.target_stat, all_player_stats_df_for_points=df_for_team_perf_calc.copy(), seasons=seasons_list)
-            
-        # df_featured = feature_engineering(df_raw.copy(), 
-        #                                 target_stat=args.target_stat, 
-        #                                 opponent_defense_df=df_opponent_defense_ravg,
-        #                                 team_performance_df=df_team_performance_ravg)
-
-        df_featured = generate_full_feature_set(base_df=df_raw.copy(),
-                                                target_stat=args.target_stat,
-                                                opponent_defense_df=df_opponent_defense_ravg,
-                                                team_performance_df=df_team_performance_ravg)
-
-        if df_featured.empty:
-            logger.error("DataFrame empty after feature engineering. Exiting pipeline.")
-            return
-
-        trained_pipeline, eval_metrics = train_and_evaluate_model(df_featured, args.target_stat)
-        
-        if trained_pipeline and eval_metrics:
-            save_model_artifact_and_metadata(db, trained_pipeline, args.target_stat, eval_metrics)
+    # --- Evaluation ---
+    logger.info("Evaluating model performance on the test set...")
+    y_pred = best_pipeline.predict(X_test)
+    metrics = {}
+    if model_type == 'regression':
+        if lmbda is not None:
+            y_test = inv_boxcox(y_test, lmbda)
+            y_pred = inv_boxcox(y_pred, lmbda)
+        metrics['mae'] = mean_absolute_error(y_test, y_pred)
+        metrics['r2'] = r2_score(y_test, y_pred)
+        logger.info(f"Test Set Metrics for {target_stat} ({model_type}): {metrics}")
+    else: # classification
+        y_pred_proba = best_pipeline.predict_proba(X_test)[:, 1]
+        metrics['accuracy'] = accuracy_score(y_test, y_pred)
+        # Ensure there's more than one class in y_test for roc_auc
+        if len(np.unique(y_test)) > 1:
+            metrics['roc_auc'] = roc_auc_score(y_test, y_pred_proba)
         else:
-            logger.warning("Model training or evaluation failed. Artifact not saved.")
-            
-    except Exception as e:
-        logger.error(f"An error occurred in the main training pipeline: {e}", exc_info=True)
-    finally:
-        if db is not None:
-            logger.info("Closing database session.")
-            db.close()
-        
-    logger.info("Model training pipeline finished.")
+            metrics['roc_auc'] = float('nan') # Not applicable
+        logger.info(f"Test Set Metrics for {target_stat} ({model_type}): {metrics}")
 
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Train a WNBA player stat prediction model.")
-    parser.add_argument("--target_stat", type=str, required=True, 
-                        help="The player statistic to predict (e.g., 'points', 'rebounds', 'assists'). Must be a column in PlayerStat model.")
-    parser.add_argument("--seasons", type=str, default=None,
-                        help="Optional comma-separated list of seasons (years) to train on (e.g., '2022,2023'). Defaults to all available if not specified in load_data.")
+    # --- ICP Score Calculation ---
+    if model_type == 'regression':
+        calib_pred = best_pipeline.predict(X_calib)
+        if lmbda is not None:
+            y_calib = inv_boxcox(y_calib, lmbda)
+            calib_pred = inv_boxcox(calib_pred, lmbda)
+        nonconformity_scores = np.abs(y_calib - calib_pred)
+    else: # classification
+        calib_pred_proba = best_pipeline.predict_proba(X_calib)
+        # Get probabilities for the true class
+        true_class_probs = calib_pred_proba[np.arange(len(y_calib)), y_calib.astype(int)]
+        nonconformity_scores = 1 - true_class_probs
+
+    # --- Save Artifacts and Metadata ---
+    try:
+        # Create a general name for the model type and a unique version name with a timestamp
+        model_name_general = f"{target_stat}_{model_type}"
+        timestamp = datetime.datetime.now().strftime("%Y%m%d%H%M%S")
+        version_name = f"{model_name_general}_{timestamp}"
+
+        # Define paths for saving artifacts
+        model_dir = PROJECT_ROOT / "models" / model_name_general
+        model_dir.mkdir(parents=True, exist_ok=True)
+        
+        pipeline_path = model_dir / f"{version_name}_pipeline.joblib"
+        scores_path = model_dir / f"{version_name}_icp_scores.joblib"
+
+        # Save the trained pipeline and nonconformity scores
+        joblib.dump(best_pipeline, pipeline_path)
+        logger.info(f"Saved model pipeline to {pipeline_path}")
+        
+        joblib.dump(nonconformity_scores, scores_path)
+        logger.info(f"Saved ICP nonconformity scores to {scores_path}")
+
+        # Prepare metadata for DB, satisfying the schema
+        model_version_data = ModelVersionCreate(
+            model_name=model_name_general,
+            version_name=version_name,
+            model_type=model_type,
+            target_stat=target_stat,
+            seasons=seasons,
+            description=f"XGBoost {model_type} model for {target_stat}",
+            pipeline_path=str(pipeline_path.relative_to(PROJECT_ROOT)),
+            model_path=str(pipeline_path.relative_to(PROJECT_ROOT)),
+            metrics=convert_numpy_types(metrics),
+            parameters=convert_numpy_types(best_pipeline.named_steps['model'].get_params()),
+            feature_names= list(X.columns),
+            nonconformity_scores_path=str(scores_path.relative_to(PROJECT_ROOT)) if model_type == 'regression' else None,
+            nonconformity_scores_clf_path=str(scores_path.relative_to(PROJECT_ROOT)) if model_type == 'classification' else None,
+            model_uuid=str(uuid.uuid4()),
+            version=1,
+            training_date=datetime.datetime.now()
+        )
+
+        created_model_version = await create_model_version(db_session, model_version_data)
+        if created_model_version:
+            logger.info(f"Successfully created model version entry with ID: {created_model_version.id}")
+        else:
+            logger.error("Failed to create model version entry in DB, but no exception was raised.")
+
+    except Exception as e:
+        logger.error(f"Failed to create model version in DB for {version_name}. Error: {e}")
+        logger.error(f"Traceback: {traceback.format_exc()}")
+        return False
+
+    logger.info(f"Finished processing for {target_stat} ({model_type}).")
+    return True
+
+
+async def main(target_stat: str, model_type: str, seasons: List[int], transform: bool):
+    """Main function to run the training process."""
+    logger.info(f"Starting model training for stat: '{target_stat}', type: '{model_type}', seasons: {seasons}")
     
-    cli_args = parser.parse_args()
-    main(cli_args) 
+    async with AsyncSessionLocal() as db_session:
+        try:
+            df = await load_data(db_session, target_stat, model_type, seasons)
+
+            if df is None or df.empty:
+                logger.warning(f"Initial data load is too small for {target_stat} in seasons {seasons}. Skipping training.")
+                return
+
+            all_stats_df_for_features = await load_all_player_stats_for_seasons(db_session, seasons)
+
+            if all_stats_df_for_features.empty:
+                logger.error("Could not load player stats for feature generation. Aborting.")
+                return
+
+            df_featured = generate_full_feature_set(
+                base_df=df,
+                team_context_df=all_stats_df_for_features,
+                target_stat=target_stat,
+                rolling_windows=ROLLING_WINDOWS
+            )
+
+            if model_type == 'classification':
+                df_featured = generate_synthetic_prop_line(df_featured, target_stat)
+                if 'target' not in df_featured or df_featured['target'].isnull().all():
+                     logger.error("Failed to generate a valid 'target' column for classification. Skipping.")
+                     return
+
+            await train_and_evaluate_model(
+                df=df_featured,
+                target_stat=target_stat,
+                model_type=model_type,
+                seasons=seasons,
+                db_session=db_session,
+                apply_box_cox=transform
+            )
+
+        except Exception as e:
+            logger.error(f"An error occurred during the training process for {target_stat} ({model_type}): {e}")
+            logger.error(traceback.format_exc())
+        finally:
+            logger.info(f"Finished processing for {target_stat} ({model_type}).")
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser(description="Train a model for a specific player stat.")
+    parser.add_argument("--target_stat", type=str, required=True, help="The target statistic to model (e.g., 'points').")
+    parser.add_argument("--model_type", type=str, choices=['classification', 'regression'], required=True, help="The type of model to train.")
+    parser.add_argument("--seasons", nargs='+', type=int, default=DEFAULT_SEASONS, help="List of seasons to use for training data.")
+    parser.add_argument("--transform", action='store_true', help="Apply Box-Cox transformation to the target variable (for regression only).")
+    args = parser.parse_args()
+
+    asyncio.run(main(
+        target_stat=args.target_stat,
+        model_type=args.model_type,
+        seasons=args.seasons,
+        transform=args.transform
+    ))

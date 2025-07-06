@@ -6,9 +6,9 @@ from typing import List, Optional
 import logging # For logger in potential generate endpoint
 from fastapi import status # Add this
 
-from .. import dependencies as deps
-from ..crud import parlays as crud_parlays
-from schemas import parlay as parlay_schema # Alias for clarity
+from backend.app import dependencies as deps
+from backend.app.crud import parlays as crud_parlays
+from backend.schemas import parlay as parlay_schema # Alias for clarity
 from backend.app.dependencies import get_db
 
 # Get an instance of a logger

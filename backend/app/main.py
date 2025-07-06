@@ -1,15 +1,13 @@
 import sys
 import os
-
-PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
-if PROJECT_ROOT not in sys.path:
-    sys.path.insert(0, PROJECT_ROOT)
-
+import logging
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from schemas.health import PingResponse
-from .routers import player_stats, odds
-from .routers import model_versions, predictions, parlays
+from backend.schemas.health import PingResponse
+from backend.app.routers import player_stats, odds, model_versions, predictions, parlays
+
+# Configure logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 
 app = FastAPI(
     title="WNBA Betting Recommender API",

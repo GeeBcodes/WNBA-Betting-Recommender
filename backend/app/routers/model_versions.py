@@ -5,9 +5,9 @@ import uuid # For UUID type
 from typing import List
 from fastapi import status
 
-from .. import crud
-from schemas import model_version as model_version_schema # Alias for clarity
-from ..dependencies import get_db
+from backend.app import crud
+from backend.schemas import model_version as model_version_schema # Alias for clarity
+from backend.app.dependencies import get_db
 
 router = APIRouter(
     prefix="/model_versions",

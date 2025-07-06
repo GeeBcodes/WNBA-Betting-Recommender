@@ -12,4 +12,7 @@ class PlayerCreate(PlayerBase):
 
 class Player(PlayerBase):
     id: uuid.UUID
-    model_config = ConfigDict(from_attributes=True) 
+    team_id: Optional[uuid.UUID] = None
+    
+    class Config:
+        from_attributes = True 

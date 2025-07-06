@@ -79,6 +79,39 @@ const DataGrid: React.FC<DataGridProps> = ({ predictions, onSelectionChanged }) 
       cellDataType: 'number',
       minWidth: 120
     },
+    {
+      headerName: "ICP Interval",
+      valueGetter: p => {
+          if (p.data?.predicted_value_interval_lower != null && p.data?.predicted_value_interval_upper != null) {
+              return `[${p.data.predicted_value_interval_lower.toFixed(2)}, ${p.data.predicted_value_interval_upper.toFixed(2)}]`;
+          }
+          return 'N/A';
+      },
+      sortable: false,
+      minWidth: 140
+    },
+    {
+        field: "over_p_value_calibrated",
+        headerName: "Calibrated Over",
+        sortable: true,
+        valueFormatter: p => (typeof p.value === 'number' ? (p.value * 100).toFixed(1) + '%' : 'N/A'),
+        cellDataType: 'number',
+        minWidth: 140
+    },
+    {
+        field: "under_p_value_calibrated",
+        headerName: "Calibrated Under",
+        sortable: true,
+        valueFormatter: p => (typeof p.value === 'number' ? (p.value * 100).toFixed(1) + '%' : 'N/A'),
+        cellDataType: 'number',
+        minWidth: 140
+    },
+    {
+        field: "prediction_set",
+        headerName: "ICP Set",
+        valueGetter: p => p.data?.prediction_set?.join(', ') || 'N/A',
+        minWidth: 120
+    },
     // Removed: player_prop_odd_id, model_version_id, prediction_datetime
   ], []);
 
@@ -90,7 +123,7 @@ const DataGrid: React.FC<DataGridProps> = ({ predictions, onSelectionChanged }) 
   }, [onSelectionChanged]);
 
   return (
-    <div className="ag-theme-quartz" style={{ height: 500, width: '100%' }}>
+    <div className="ag-theme-quartz" style={{ height: 800, width: '100%' }}>
       <AgGridReact<Prediction>
         ref={gridRef} // Assign ref
         rowData={predictions}
@@ -104,8 +137,8 @@ const DataGrid: React.FC<DataGridProps> = ({ predictions, onSelectionChanged }) 
           resizable: true,
         }}
         pagination={true}
-        paginationPageSize={10}
-        paginationPageSizeSelector={[10, 25, 50]}
+        paginationPageSize={20}
+        paginationPageSizeSelector={[10, 20, 50, 100]}
       />
     </div>
   );
